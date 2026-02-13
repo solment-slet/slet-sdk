@@ -1,0 +1,8 @@
+[project]
+name = "slet-sdk"
+version = "0.1.1"
+dependencies = ["httpx", "pydantic"]
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
