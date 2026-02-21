@@ -1,7 +1,7 @@
 [project]
 name = "slet-sdk"
 version = "0.1.1"
-dependencies = ["httpx", "pydantic"]
+dependencies = ["httpx", "pydantic", "websockets"]
 
 [build-system]
 requires = ["setuptools"]

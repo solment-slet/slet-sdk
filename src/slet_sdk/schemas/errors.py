@@ -30,6 +30,13 @@ class TokenRefreshError(Unauthorized):
     )
 
 
+class InvalidAccessToken(Unauthorized):
+    error: str = ErrorCode.INVALID_ACCESS_TOKEN
+    message: str = Field(
+        "Invalid Access Token",
+    )
+
+
 # ===========================
 # 404
 # ===========================

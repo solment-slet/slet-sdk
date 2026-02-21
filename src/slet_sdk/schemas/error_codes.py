@@ -13,6 +13,7 @@ class ErrorCode(str, Enum):
     UNAUTHORIZED = "unauthorized"  # base
     INVALID_CREDENTIALS = "invalid_credentials"
     TOKEN_REFRESH_ERROR = "token_refresh_error"
+    INVALID_ACCESS_TOKEN = "invalid_access_token"
 
     ## 404
     RESOURCE_NOT_FOUND = "resource_not_found"  # base
