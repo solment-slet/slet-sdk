@@ -186,8 +186,6 @@ class SletClient:
         if not isinstance(manifest, dict):
             manifest = manifest.model_dump()
 
-        print(f"[DEBUG] {str(manifest)}")
-
         return await self._request(
             "POST",
             f"/ae/agent/deploy/{thread_id}",

@@ -13,12 +13,13 @@ class SletClientError(Exception):
         self.error = error.error
         self.message = error.message
         self.extra = error.extra
+        self.trace_id = getattr(error, "trace_id", None)
         super().__init__(error.message)
 
     def to_dict(self, stringify_error: bool = False) -> dict:
         if (
             stringify_error
-        ):  # Чтобы добавить extra только если он есть, и преобразовать error в строку (т.к. как он может быть enum)
+        ):  # Чтобы добавить extra, trace_id только если он есть, и преобразовать error в строку (т.к. как он может быть enum)
             if isinstance(self.error, Enum):
                 error = self.error.value
             else:
@@ -32,6 +33,8 @@ class SletClientError(Exception):
 
             if self.extra:
                 result["extra"] = self.extra
+            if self.trace_id:
+                result["trace_id"] = self.trace_id
 
             return result
 
@@ -40,6 +43,7 @@ class SletClientError(Exception):
             "error": self.error,
             "message": self.message,
             "extra": self.extra,
+            "trace_id": self.trace_id,
         }
 
     def __str__(self):
