@@ -1,5 +1,5 @@
 from enum import Enum
-from slet_sdk.schemas import ErrorResponse
+from slet_sdk.core.schemas import ErrorResponse
 
 
 class SletClientError(Exception):

@@ -7,9 +7,9 @@ from typing import AsyncGenerator, AsyncIterable, Callable, Optional, Dict, Any,
 import websockets
 from websockets.exceptions import ConnectionClosed
 
-from slet_sdk.schemas import ErrorResponse, ErrorCode
-from slet_sdk.schemas.errors import CallbackError, BackgroundListenerError
-from slet_sdk.exceptions import SletClientError
+from slet_sdk.core.schemas import ErrorResponse, ErrorCode
+from slet_sdk.core.schemas.errors import CallbackError, BackgroundListenerError
+from slet_sdk.core.exceptions import SletClientError
 
 logger = logging.getLogger(__name__)
 
@@ -140,7 +140,7 @@ class AgentSession:
     def register_tools_from_registry(self):
         """Загружает инструменты из глобального реестра SDK (если есть)."""
         try:
-            from slet_sdk.tools import get_registered_tools
+            from slet_sdk.aelite.tools import get_registered_tools
             self._registered_tools.update(get_registered_tools())
         except ImportError:
             pass

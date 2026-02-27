@@ -1,29 +1,39 @@
 import httpx
 import json
-from typing import Any, Dict
+from typing import Any
 from pydantic import BaseModel, ValidationError
 
-from slet_sdk.schemas import ErrorCode, ErrorResponse
-from slet_sdk.exceptions import SletClientError
-from slet_sdk.schemas.errors import NetworkError
-from slet_sdk.agent import AgentSession
-from slet_sdk.schemas.agent import AgentManifest
-from slet_sdk.schemas.auth import (
+from slet_sdk.core.schemas import ErrorCode, ErrorResponse
+from slet_sdk.core.exceptions import SletClientError
+from slet_sdk.core.schemas.errors import NetworkError
+from slet_sdk.core.schemas.auth import (
     UserLoginResponse,
     UserRegisterResponse,
     UserRefreshResponse,
 )
+
+# Ленивый импорт сервисов
+from slet_sdk.aelite.resource import AeliteResource
 
 BASE_URL = "http://x.net"
 
 
 class SletClient:
     """
-    Лёгкий асинхронный HTTP-клиент для Slet API с авто-рефрешем токена.
+    Единый асинхронный клиент для всех сервисов Slet API.
+
+    Использование:
+        async with SletClient() as client:
+            await client.signin("user@example.com", "password")
+            await client.agents.deploy(thread_id, manifest)
+            balance = await client.billing.get_balance()
     """
 
     def __init__(
-        self, base_url: str = BASE_URL, timeout: float = 500.0, ssl_verify: bool = True
+        self,
+        base_url: str = BASE_URL,
+        timeout: float = 500.0,
+        ssl_verify: bool = True,
     ):
         self.base_url = base_url
         self._client = httpx.AsyncClient(
@@ -32,7 +42,11 @@ class SletClient:
         self.access_token: str | None = None
         self.refresh_token: str | None = None
 
+        # ── Namespace-ресурсы (продукты) ──────────────────────
+        self.aelite = AeliteResource(self)
+
     # ------------------ Context Manager ------------------
+
     async def __aenter__(self) -> "SletClient":
         # Просто возвращаем себя
         return self
@@ -42,13 +56,18 @@ class SletClient:
         await self.close()
 
     # ------------------ Internal Methods ------------------
+
     def _auth_headers(self) -> dict[str, str]:
         if not self.access_token:
             raise ValueError("Access token is missing. Login first.")
         return {"Authorization": f"Bearer {self.access_token}"}
 
-    async def _request(
-        self, method: str, url: str, schema: BaseModel | None = None, **kwargs: Any
+    async def request(
+        self,
+        method: str,
+        url: str,
+        schema: BaseModel | None = None,
+        **kwargs: Any,
     ) -> dict:
         """
         Универсальный запрос с автоматическим рефрешем токена.
@@ -123,10 +142,10 @@ class SletClient:
             extra=data.get("extra", {}),
         )
 
-    # ------------------ Public API ------------------
+    # ------------------ Auth ------------------
 
     async def signin(self, email: str, password: str) -> dict:
-        data = await self._request(
+        data = await self.request(
             "POST",
             "/signin",
             schema=UserLoginResponse,
@@ -145,7 +164,7 @@ class SletClient:
         return data
 
     async def signup(self, name: str, email: str, password: str) -> dict:
-        data = await self._request(
+        data = await self.request(
             "POST",
             "/signup",
             schema=UserRegisterResponse,
@@ -165,7 +184,7 @@ class SletClient:
 
     async def refresh_tokens(self, refresh_token: str | None = None) -> dict:
         token = self.refresh_token if refresh_token is None else refresh_token
-        data = await self._request(
+        data = await self.request(
             "POST",
             "/refresh",
             schema=UserRefreshResponse,
@@ -175,62 +194,22 @@ class SletClient:
         self.refresh_token = data.get("refresh_token")
         return data
 
-    async def deploy_agent(
-        self, thread_id: str, manifest: AgentManifest | Dict[str, Any]
-    ) -> dict:
-        """
-        Деплоит агента на сервере.
-        :param thread_id: ID сессии (чата)
-        :param manifest: Конфигурацией агента (AgentManifest)
-        """
-        if not isinstance(manifest, dict):
-            manifest = manifest.model_dump()
-
-        return await self._request(
-            "POST",
-            f"/ae/agent/deploy/{thread_id}",
-            json=manifest,
-        )
-
-    async def connect_agent(self, thread_id: str) -> AgentSession:
-        """
-        Создает WebSocket сессию для общения с агентом.
-        :param thread_id: ID сессии
-        :return: Объект AgentSession
-        """
-        # Формируем WS URL на основе HTTP URL
-        # http://x.net -> ws://x.net
-        # https://x.net -> wss://x.net
-        ws_base = self.base_url.replace("http://", "ws://").replace(
-            "https://", "wss://"
-        )
-        ws_url = f"{ws_base}/ae/agent/ws/{thread_id}"
-
-        # Получаем заголовки авторизации
-        headers = {}
-        if self.access_token:
-            # Websockets библиотека требует список кортежей или dict, но заголовки Auth часто передают в query params
-            # или через extra_headers. AElite сервер должен поддерживать Auth header.
-            headers["Authorization"] = f"Bearer {self.access_token}"
-
-        session = AgentSession(ws_url, headers)
-        await session.connect()
-        return session
+    # ──────────────── Generic HTTP ───────────────────────────
 
     async def get(self, url: str, **kwargs: Any) -> dict:
-        return await self._request("GET", url, **kwargs)
+        return await self.request("GET", url, **kwargs)
 
     async def post(self, url: str, **kwargs: Any) -> dict:
-        return await self._request("POST", url, **kwargs)
+        return await self.request("POST", url, **kwargs)
 
     async def put(self, url: str, **kwargs: Any) -> dict:
-        return await self._request("PUT", url, **kwargs)
+        return await self.request("PUT", url, **kwargs)
 
     async def patch(self, url: str, **kwargs: Any) -> dict:
-        return await self._request("PATCH", url, **kwargs)
+        return await self.request("PATCH", url, **kwargs)
 
     async def delete(self, url: str, **kwargs: Any) -> dict:
-        return await self._request("DELETE", url, **kwargs)
+        return await self.request("DELETE", url, **kwargs)
 
     async def close(self):
         await self._client.aclose()

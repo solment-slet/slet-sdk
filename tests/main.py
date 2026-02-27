@@ -1,10 +1,11 @@
 import asyncio
 from typing import AsyncIterable
+
 from aioconsole import ainput
 from slet_sdk import SletClient
 from slet_sdk.schemas import ErrorResponse
-from slet_sdk.schemas.agent import AgentManifest, ToolConfig, MemoryConfig
-from slet_sdk.tools import tool
+from slet_sdk.aelite.schemas import AgentManifest, ToolConfig, MemoryConfig
+from slet_sdk.aelite.tools import tool
 
 SYSTEM_PROMPT = """The assistant is Aelite, created by Slet Corporation. The current date is Sunday, February 22, 2026.
 
@@ -90,7 +91,7 @@ async def stream_messages_handler(stream: AsyncIterable[str]):
     print("\n[АГЕНТ ЗАКОНЧИЛ]")
 
 async def main():
-    async with SletClient(base_url="http://localhost:8000") as client:
+    async with (SletClient(base_url="http://localhost:8000") as client):
         await client.signin("esolment@gmail.com", "20132061esS")
 
         manifest = AgentManifest(
@@ -107,13 +108,16 @@ async def main():
         print(f"[DEBUG] {manifest.model_dump()}")
         thread_id = "sess-14399ddfbld33dgd"
 
+        import inspect
+        print(inspect.signature(client.aelite.deploy))
+
         # Инициализируем агента на сервере (или пересоздаем если он уже был создан, пересоздает только самого агента не трогая историю чата).
         print("Deploying agent...")
-        await client.deploy_agent(thread_id, manifest)
+        await client.aelite.deploy(thread_id, manifest)
         print("Agent deployed!")
 
         # Подключаемся к агенту
-        agent = await client.connect_agent(thread_id)
+        agent = await client.aelite.connect(thread_id)
         
         # Автоматически регистрирует все @tool из глобального реестра
         agent.register_tools_from_registry()

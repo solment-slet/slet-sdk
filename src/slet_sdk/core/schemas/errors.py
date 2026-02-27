@@ -2,8 +2,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from slet_sdk.schemas import ErrorCode
-from slet_sdk.schemas.client_base import ErrorResponse
+from slet_sdk.core.schemas import ErrorCode
+from slet_sdk.core.schemas.client_base import ErrorResponse
 
 
 # ===========================
