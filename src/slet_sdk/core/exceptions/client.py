@@ -13,7 +13,7 @@ class SletClientError(Exception):
         self.error = error.error
         self.message = error.message
         self.extra = error.extra
-        self.trace_id = getattr(error, "trace_id", None)
+        self.trace_id = error.trace_id
         super().__init__(error.message)
 
     def to_dict(self, stringify_error: bool = False) -> dict:

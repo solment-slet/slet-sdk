@@ -123,6 +123,11 @@ class TooManyAttempts(TooManyRequests):
     error: str = ErrorCode.TOO_MANY_ATTEMPTS
     message: str = Field("Too Many Attempts", examples=["Too Many Attempts"])
 
+    def __init__(self, *, retry_after: int = 60, **kwargs):
+        kwargs.pop("extra", None)
+        kwargs["extra"] = TooManyRequestsExtra(retry_after=retry_after)
+        super().__init__(**kwargs)
+
 
 # ===========================
 # 500
@@ -166,11 +171,3 @@ class CallbackError(CustomError):
     """
     status: int = 600
     error: str = ErrorCode.CALLBACK_ERROR
-
-class BackgroundListenerError(CustomError):
-    """
-    Unknown error in websocket background listener
-    """
-    status: int = 600
-    error: str = ErrorCode.BACKGROUND_LISTENER_ERROR
-    message: str = Field("Unknown error in websocket background listener")

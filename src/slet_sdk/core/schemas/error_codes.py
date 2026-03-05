@@ -1,11 +1,10 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class ErrorCode(str, Enum):
+class ErrorCode(StrEnum):
     """
     Каталог кодов ошибок (не HTTP кодов)
     """
-
     UNKNOWN_ERROR = "unknown_error"
 
     # 4xx

@@ -1,8 +1,17 @@
 import httpx
 import json
-from typing import Any
+import logging
+from typing import (
+    Any,
+    Optional,
+    Type,
+    TypeVar,
+    overload,
+)
+
 from pydantic import BaseModel, ValidationError
 
+from slet_sdk.core.typing import LoggerLike
 from slet_sdk.core.schemas import ErrorCode, ErrorResponse
 from slet_sdk.core.exceptions import SletClientError
 from slet_sdk.core.schemas.errors import NetworkError
@@ -11,9 +20,9 @@ from slet_sdk.core.schemas.auth import (
     UserRegisterResponse,
     UserRefreshResponse,
 )
+from slet_sdk.aelite.resources.resource import AeliteResource
 
-# Ленивый импорт сервисов
-from slet_sdk.aelite.resource import AeliteResource
+T = TypeVar("T", bound=BaseModel)
 
 BASE_URL = "http://x.net"
 
@@ -25,8 +34,7 @@ class SletClient:
     Использование:
         async with SletClient() as client:
             await client.signin("user@example.com", "password")
-            await client.agents.deploy(thread_id, manifest)
-            balance = await client.billing.get_balance()
+            await client.aelite.deploy(manifest)
     """
 
     def __init__(
@@ -34,8 +42,13 @@ class SletClient:
         base_url: str = BASE_URL,
         timeout: float = 500.0,
         ssl_verify: bool = True,
+        logger: Optional[LoggerLike] = None,
     ):
+        self.logger = logger or logging.getLogger(__name__)
         self.base_url = base_url
+        self.base_ws_url = self.base_url.replace("http://", "ws://").replace(
+            "https://", "wss://"
+        )
         self._client = httpx.AsyncClient(
             base_url=base_url, timeout=httpx.Timeout(timeout), verify=ssl_verify
         )
@@ -59,51 +72,79 @@ class SletClient:
 
     def _auth_headers(self) -> dict[str, str]:
         if not self.access_token:
-            raise ValueError("Access token is missing. Login first.")
+            raise SletClientError(
+                ErrorResponse(
+                    status=0,
+                    error=ErrorCode.VALIDATION_ERROR,
+                    message="Access token is missing. Call signin() first.",
+                )
+            )
         return {"Authorization": f"Bearer {self.access_token}"}
 
+    @overload
     async def request(
-        self,
-        method: str,
-        url: str,
-        schema: BaseModel | None = None,
-        **kwargs: Any,
+            self, method: str, url: str, schema: Type[T], **kwargs: Any
+    ) -> T:
+        ...
+
+    @overload
+    async def request(
+            self, method: str, url: str, schema: None = None, **kwargs: Any
     ) -> dict:
-        """
-        Универсальный запрос с автоматическим рефрешем токена.
-        """
+        ...
+
+    async def request(
+            self,
+            method: str,
+            url: str,
+            schema: Type[T] | None = None,
+            **kwargs: Any,
+    ) -> dict | T:
+        return await self._request_impl(method, url, schema=schema, **kwargs)
+
+    async def _request_impl(
+            self,
+            method: str,
+            url: str,
+            schema: Type[T] | None = None,
+            *,
+            _skip_refresh: bool = False,
+            **kwargs: Any,
+    ) -> dict | T:
+        last_resp: httpx.Response | None = None
+
         for attempt in range(2):
-            # добавляем авторизацию, если есть токен
-            headers = kwargs.pop("headers", {})
+            merged_headers = {**kwargs.get("headers", {})}
             if self.access_token:
-                headers.update(self._auth_headers())
-            kwargs["headers"] = headers
+                merged_headers["Authorization"] = f"Bearer {self.access_token}"
+            request_kwargs = {**kwargs, "headers": merged_headers}
 
             try:
-                resp = await self._client.request(method, url, **kwargs)
+                resp = await self._client.request(method, url, **request_kwargs)
             except httpx.TransportError as e:
                 raise SletClientError(NetworkError(message=str(e)))
 
-            # успешный ответ
+            last_resp = resp
+
             if 200 <= resp.status_code < 300:
                 data = self._parse_json(resp)
-                if schema:
-                    self._validate_schema(data, schema, resp.status_code)
-                return data
+                return self._validate_schema(data, schema, resp.status_code) if schema else data
 
-            # 401 → проверяем рефреш токена
-            if resp.status_code == 401:
-                data = self._parse_json(resp, allow_fail=True)
-                if data.get("error") == ErrorCode.INVALID_ACCESS_TOKEN:
-                    if self.refresh_token:
-                        await self.refresh_tokens()
-                        continue  # повторяем запрос после рефреша
-                # иначе падаем с ошибкой
-            # Любой другой ответ → выбрасываем
+            if (
+                    resp.status_code == 401
+                    and not _skip_refresh
+                    and attempt == 0
+                    and self.refresh_token
+            ):
+                err_data = self._parse_json(resp, allow_fail=True)
+                if err_data.get("error") == ErrorCode.INVALID_ACCESS_TOKEN:
+                    await self.refresh_tokens()
+                    continue
+
             raise SletClientError(self._build_error(resp))
 
-        # если дошли сюда, значит 2 попытки не удались
-        raise SletClientError(self._build_error(resp))
+        assert last_resp is not None
+        raise SletClientError(self._build_error(last_resp))
 
     def _parse_json(self, resp: httpx.Response, allow_fail: bool = False) -> dict:
         try:
@@ -120,16 +161,16 @@ class SletClient:
                 )
             )
 
-    def _validate_schema(self, data: dict, schema: BaseModel, status: int):
+    def _validate_schema(self, data: dict, schema: Type[T], status: int) -> T:
         try:
-            schema.model_validate(data)
+            return schema.model_validate(data)
         except ValidationError as exc:
             raise SletClientError(
                 ErrorResponse(
                     status=status,
                     error=ErrorCode.VALIDATION_ERROR,
                     message="Response does not match schema",
-                    extra=exc.errors(),
+                    extra={"validation_errors": exc.errors()},
                 )
             )
 
@@ -140,19 +181,20 @@ class SletClient:
             error=data.get("error", ErrorCode.VALIDATION_ERROR),
             message=data.get("message", resp.text),
             extra=data.get("extra", {}),
+            trace_id=data.get("trace_id", None),
         )
 
     # ------------------ Auth ------------------
 
-    async def signin(self, email: str, password: str) -> dict:
+    async def signin(self, email: str, password: str) -> UserLoginResponse:
         data = await self.request(
             "POST",
             "/signin",
             schema=UserLoginResponse,
             json={"email": email, "password": password},
         )
-        self.access_token = data.get("access_token")
-        self.refresh_token = data.get("refresh_token")
+        self.access_token = data.access_token
+        self.refresh_token = data.refresh_token
         if not self.access_token or not self.refresh_token:
             raise SletClientError(
                 ErrorResponse(
@@ -163,15 +205,15 @@ class SletClient:
             )
         return data
 
-    async def signup(self, name: str, email: str, password: str) -> dict:
+    async def signup(self, name: str, email: str, password: str) -> UserRegisterResponse:
         data = await self.request(
             "POST",
             "/signup",
             schema=UserRegisterResponse,
             json={"name": name, "email": email, "password": password},
         )
-        self.access_token = data.get("access_token")
-        self.refresh_token = data.get("refresh_token")
+        self.access_token = data.access_token
+        self.refresh_token = data.refresh_token
         if not self.access_token or not self.refresh_token:
             raise SletClientError(
                 ErrorResponse(
@@ -182,16 +224,17 @@ class SletClient:
             )
         return data
 
-    async def refresh_tokens(self, refresh_token: str | None = None) -> dict:
+    async def refresh_tokens(self, refresh_token: str | None = None) -> UserRefreshResponse:
         token = self.refresh_token if refresh_token is None else refresh_token
-        data = await self.request(
+        data = await self._request_impl(
             "POST",
             "/refresh",
             schema=UserRefreshResponse,
+            _skip_refresh=True,
             json={"refresh_token": token},
         )
-        self.access_token = data.get("access_token")
-        self.refresh_token = data.get("refresh_token")
+        self.access_token = data.access_token
+        self.refresh_token = data.refresh_token
         return data
 
     # ──────────────── Generic HTTP ───────────────────────────

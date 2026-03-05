@@ -14,22 +14,16 @@ _TYPE_TO_STR = {
 }
 
 
-def tool(name: str = None, description: str = None, **extra):
+def tool(_fn: Callable = None, *, name: str = None, description: str = None, **extra):
     """
     Декоратор для клиентского инструмента.
-    Дополнительные kwargs (broadcast, и т.д.) попадают в манифест автоматически.
 
-    Использование:
+    Можно использовать:
+        @tool
         @tool()
-        def get_clipboard() -> str:
-            '''Возвращает буфер обмена'''
-            ...
-
-        @tool(broadcast=True)
-        def show_notification(title: str, message: str) -> str:
-            '''Показывает уведомление на всех устройствах'''
-            ...
+        @tool(name="x", broadcast=True)
     """
+
     def decorator(fn: Callable) -> Callable:
         tool_name = name or fn.__name__
         tool_desc = description or fn.__doc__
@@ -39,7 +33,7 @@ def tool(name: str = None, description: str = None, **extra):
 
         sig = inspect.signature(fn)
         hints = get_type_hints(fn)
-        
+
         params: Dict[str, Dict[str, Any]] = {}
         for param_name, param in sig.parameters.items():
             if param_name in ("self", "cls"):
@@ -49,7 +43,7 @@ def tool(name: str = None, description: str = None, **extra):
             type_str = _TYPE_TO_STR.get(py_type, "str")
 
             has_default = param.default is not inspect.Parameter.empty
-            
+
             params[param_name] = {
                 "type": type_str,
                 "description": "",
@@ -60,12 +54,17 @@ def tool(name: str = None, description: str = None, **extra):
         fn._tool_name = tool_name
         fn._tool_description = tool_desc.strip()
         fn._tool_params = params
-        fn._tool_extra = extra  # ← сохраняем все доп. параметры
+        fn._tool_extra = extra
         fn._is_client_tool = True
 
         _REGISTERED_CLIENT_TOOLS[tool_name] = fn
         return fn
 
+    # ✅ Если декоратор вызван как @tool
+    if _fn is not None and callable(_fn):
+        return decorator(_fn)
+
+    # ✅ Если вызван как @tool(...)
     return decorator
 
 

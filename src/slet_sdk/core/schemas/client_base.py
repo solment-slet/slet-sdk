@@ -19,3 +19,4 @@ class ErrorResponse(BaseModel):
     error: str
     message: str
     extra: dict[str, Any | None] = Field(default_factory=dict)
+    trace_id: str | None = None
