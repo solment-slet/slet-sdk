@@ -1,13 +1,9 @@
 import asyncio
-
+import sys
 from aioconsole import ainput
 from slet_sdk import SletClient
 from slet_sdk.aelite.manifest import AgentManifest, ToolConfig, MemoryConfig
 from slet_sdk.aelite.tools import tool
-
-
-SYSTEM_PROMPT = """Ты полезный ассистент по имени Aelite, 
-ты можешь использовать своих подагентов для помощи пользователю"""
 
 
 @tool
@@ -22,44 +18,53 @@ async def show_notification(title: str, message: str) -> None:
     print(f"\n🔔 [{title}] {message}")
 
 
-async def main():
-    async with SletClient(base_url="http://localhost:8000") as client:
-        await client.signin("esolment@gmail.com", "20132061esS")
-
-        manifest = AgentManifest(
-            id="MainAgent",
-            system_prompt=SYSTEM_PROMPT,
-            memory=MemoryConfig(enabled=True, summarization=True),
-            tools=[
-                ToolConfig(name="get_time", type="server"),
-                get_clipboard,
-                show_notification,
-            ],
+manifest = AgentManifest(
+    id="MainAgent",
+    system_prompt="""Ты полезный ассистент по имени Aelite, 
+ты можешь использовать своих подагентов для помощи пользователю""",
+    concurrency="parallel",
+    memory=MemoryConfig(enabled=True, summarization="async"),
+    tools=[
+        ToolConfig(name="get_time", type="server"),
+        get_clipboard,
+        show_notification,
+    ],
+    sub_agents=[
+        AgentManifest(
+            id="SherlokHolms",
+            system_prompt="Ты агент-поисковик по имени Шерлок Холмс",
             sub_agents=[
                 AgentManifest(
-                    id="SherlokHolms",
-                    system_prompt="Ты агент-поисковик по имени Шерлок Холмс",
-                    sub_agents=[
-                        AgentManifest(
-                            id="Krosh",
-                            system_prompt="Ты персонаж из мультфильма Смешарики по имени Крош.",
-                        )
-                    ]
+                    id="Krosh",
+                    system_prompt="Ты персонаж из мультфильма Смешарики по имени Крош.",
                 )
             ]
         )
+    ]
+)
+
+
+async def main():
+    async with SletClient("http://localhost:8000") as client:
+        # Авторизация
+        await client.signin("tester@gmail.com", "admin12341234G")
+
+        # Создание чата
+        new_chat = await client.aelite.chats.new_chat()
 
         # Deploy + connect в одну операцию
-        agent = await client.aelite.deploy_and_connect(manifest)
+        agent = await client.aelite.deploy_and_connect(manifest, thread_id=new_chat.id)
 
-        # Тулы регистрируются автоматически, но можно и вручную
-        agent.register_tools_from_registry()
-
+        # Подписка на события
         agent.on_message = lambda msg: print(f"Пришло сообщение!: {msg}")
         agent.on_error = lambda err: print(f"Ошибка! {str(err)}")
 
         # Основной цикл
         while True:
+            # Сбрасываем буфер перед чтением
+            await asyncio.get_event_loop().run_in_executor(
+                None, sys.stdin.flush
+            )
             user_input = await ainput("YOU: ")
             files: list = []
             while True:

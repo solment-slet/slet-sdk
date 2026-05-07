@@ -11,7 +11,6 @@ class ChatSchema(BaseModel):
     id: UUID # обычно UUIDv7
     title: str
     created_at: datetime = Field(description="ISO 8601, RFC 3339")
-    # другие поля, которые хотите вернуть
 
     class Config:
         from_attributes = True  # для конвертации SQLAlchemy -> Pydantic

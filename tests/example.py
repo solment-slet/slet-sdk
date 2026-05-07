@@ -1,4 +1,4 @@
-from aelite_client import AEliteClient
+from slet_sdk.aelite_client import AEliteClient
 import asyncio
 
 

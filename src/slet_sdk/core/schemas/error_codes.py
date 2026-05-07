@@ -40,6 +40,9 @@ class ErrorCode(StrEnum):
     INTERNAL_SERVER_ERROR = "internal_server_error"  # base
     UPLOADS_BUILD_ERROR = "upload_build_error"
 
+    ## 503
+    SERVICE_UNAVAILABLE = "service_unavailable"
+
     ## >599 (Custom Errors)
     NETWORK_ERROR = "network_error"
     CALLBACK_ERROR = "callback_error"

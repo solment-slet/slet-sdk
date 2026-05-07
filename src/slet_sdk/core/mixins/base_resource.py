@@ -1,14 +1,13 @@
 from __future__ import annotations
-from typing import TYPE_CHECKING, Any, Type, TypeVar
+from typing import Any, TypeVar, TYPE_CHECKING
 
 from pydantic import BaseModel
 
-from slet_sdk.core.typing import LoggerLike
-
-T = TypeVar("T", bound=BaseModel)
-
 if TYPE_CHECKING:
     from slet_sdk.slet_client import SletClient
+    from slet_sdk.typing import LoggerLike, WebsocketsModule
+
+T = TypeVar("T", bound=BaseModel)
 
 
 class BaseResource:
@@ -26,9 +25,9 @@ class BaseResource:
         self,
         method: str,
         url: str,
-        schema: Type[T] | None = None,
+        schema: type[T] | None = None,
         **kwargs: Any,
-    ):
+    ) -> dict | T:
         return await self._client.request(
             method=method,
             url=url,
@@ -37,21 +36,25 @@ class BaseResource:
         )
 
     @property
+    def logger(self) -> LoggerLike:
+        return self._client.logger
+
+    @property
+    def websockets(self) -> WebsocketsModule:
+        return self._client.websockets
+
+    @property
+    def base_url(self) -> str:
+        return self._client.base_url
+
+    @property
+    def base_ws_url(self) -> str:
+        return self._client.base_ws_url
+
+    @property
     def _access_token(self) -> str | None:
         return self._client.access_token
 
     @property
     def _refresh_token(self) -> str | None:
         return self._client.refresh_token
-
-    @property
-    def _base_url(self) -> str:
-        return self._client.base_url
-
-    @property
-    def _base_ws_url(self) -> str:
-        return self._client.base_ws_url
-
-    @property
-    def logger(self) -> LoggerLike:
-        return self._client.logger

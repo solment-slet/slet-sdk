@@ -5,9 +5,8 @@ from slet_sdk.core.mixins import BaseResource
 from slet_sdk.aelite.agent import AgentSession
 from slet_sdk.aelite.manifest import AgentManifest
 from slet_sdk.aelite.schemas.agent import AgentDeployResponse
-from slet_sdk.aelite.schemas.chats import ChatCreateResponse
 
-# Resources
+# Sub Resources for AeliteResource
 from .chats import ChatsResource
 from .tts import TTSResource
 
@@ -17,6 +16,11 @@ class AeliteResource(BaseResource):
     Namespace для работы с AElite.
     Доступен как client.aelite в slet_client
     """
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+
+        self.chats = ChatsResource(*args, **kwargs)
+        self.tts = TTSResource(*args, **kwargs)
 
     async def deploy(
         self,
@@ -34,7 +38,7 @@ class AeliteResource(BaseResource):
             manifest = manifest.model_dump()
 
         if not thread_id:
-            chat = await self.new_chat()
+            chat = await self.chats.new_chat()
             thread_id = str(chat.id)
 
         return await self._request(
@@ -45,9 +49,9 @@ class AeliteResource(BaseResource):
         )
 
     async def deploy_and_connect(
-            self,
-            manifest: AgentManifest,
-            thread_id: str | None = None,
+        self,
+        manifest: AgentManifest,
+        thread_id: str | None = None,
     ) -> AgentSession:
         """
         Deploy + connect в одну операцию.
@@ -57,12 +61,13 @@ class AeliteResource(BaseResource):
 
         # Строим дерево сессий
         root = await self._build_session_tree(manifest, response.thread_ids)
+        root.register_tools_from_registry() # регистрируем тулы из глобального namespace
         return root
 
     async def connect(
-            self,
-            thread_ids: str | Sequence[str] | AgentDeployResponse,
-            manifest: AgentManifest | None = None,
+        self,
+        thread_ids: str | Sequence[str] | AgentDeployResponse,
+        manifest: AgentManifest | None = None,
     ) -> AgentSession | list[AgentSession]:
         """
         Создаёт WebSocket-сессии.
@@ -92,7 +97,7 @@ class AeliteResource(BaseResource):
         sessions = []
         for tid in ids:
             s = AgentSession(
-                base_url=self._base_url, thread_id=tid,
+                thread_id=tid,
                 headers=headers, resource=self,
             )
             await s.connect()
@@ -121,7 +126,6 @@ class AeliteResource(BaseResource):
             )
 
         session = AgentSession(
-            base_url=self._base_url,
             thread_id=tid,
             headers=headers,
             manifest=manifest,
@@ -135,17 +139,3 @@ class AeliteResource(BaseResource):
             session.sub[sub_manifest.id] = sub_session
 
         return session
-
-    async def new_chat(self, title: str | None = None) -> ChatCreateResponse:
-        """Создание нового чата (бизнес модель, а не реальный чат, нужно для сопоставления чата с его владельцем)"""
-        return await self._request(
-            "POST",
-            "/ae/chats/",
-            json={"title": title} if title else None,
-            schema=ChatCreateResponse,
-        )
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.chats = ChatsResource(self)
-        self.tts = TTSResource(self)

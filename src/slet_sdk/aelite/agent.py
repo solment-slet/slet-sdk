@@ -2,7 +2,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import asyncio
-import logging
 import mimetypes
 from pathlib import Path
 import inspect
@@ -19,11 +18,11 @@ from typing import (
     TYPE_CHECKING,
 )
 
-import websockets
-from websockets.exceptions import ConnectionClosed
+from websockets.exceptions import ConnectionClosed, InvalidStatus
 from slet_sdk.core.schemas import ErrorResponse, ErrorCode
 from slet_sdk.core.schemas.errors import CallbackError, NetworkError
 from slet_sdk.core.exceptions import SletClientError
+from slet_sdk.aelite.tools import get_registered_tools
 
 if TYPE_CHECKING:
     from slet_sdk.aelite.resources.resource import AeliteResource
@@ -53,30 +52,25 @@ class AgentSession:
     """
 
     def __init__(
-            self,
-            base_url: str,
-            thread_id: str,
-            headers: dict,
-            manifest: AgentManifest | None = None,
-            resource: AeliteResource | None = None,
-    ):
+        self,
+        thread_id: str,
+        headers: dict,
+        manifest: AgentManifest | None = None,
+        resource: AeliteResource | None = None,
+    ) -> None:
         self.thread_id = thread_id
         self.manifest = manifest
         self._resource = resource
-        self.sub: dict[str, "AgentSession"] = {}
+        self.sub: dict[str, AgentSession] = {}
 
-        ws_base = base_url.replace("http://", "ws://").replace(
-            "https://", "wss://"
-        )
-        base_url = base_url.replace("ws://", "http://").replace(
-            "wss://", "https://"
-        )
+        ws_base = self._resource.base_ws_url
+        base_url = self._resource.base_url
         self.http_url = base_url
         self.ws_url = ws_base
         self._ws_connect_url = f"{self.ws_url}/ae/agent/ws/" + self.thread_id
         self.headers = headers
         self.websocket = None
-        self.logger = getattr(self._resource, "logger", logging.getLogger(__name__))
+        self.logger = self._resource.logger
         self._is_connected = False
 
         # --- Настройки ---
@@ -135,10 +129,10 @@ class AgentSession:
         # Блокировка, чтобы нельзя было вызвать chat/stream параллельно
         self._lock = asyncio.Lock()
 
-    async def connect(self):
+    async def connect(self) -> None:
         """Устанавливает соединение и запускает фоновый слушатель."""
         try:
-            self.websocket = await websockets.connect(
+            self.websocket = await self._resource.websockets.connect(
                 self._ws_connect_url,
                 ping_interval=20,
                 ping_timeout=20,
@@ -151,7 +145,7 @@ class AgentSession:
             self._listener_task = asyncio.create_task(self._listen_loop())
 
             self.logger.info(f"Connected to agent at {self.ws_url}")
-        except websockets.exceptions.InvalidStatus as e:
+        except InvalidStatus as e:
             self.logger.error(f"Failed to connect to agent: {e}")
 
             err = ErrorResponse(
@@ -162,7 +156,7 @@ class AgentSession:
             self._invoke_callback(self.on_error, err)
             raise SletClientError(err)
 
-    async def disconnect(self):
+    async def disconnect(self) -> None:
         """Останавливает фоновые задачи и закрывает сокет."""
         self._manual_disconnect = True
         self._is_connected = False
@@ -214,13 +208,9 @@ class AgentSession:
             self._registered_tools[name] = fn
             self.logger.debug(f"Registered client tool: {name}")
 
-    def register_tools_from_registry(self):
+    def register_tools_from_registry(self) -> None:
         """Загружает инструменты из глобального реестра SDK (если есть)."""
-        try:
-            from slet_sdk.aelite.tools import get_registered_tools
-            self._registered_tools.update(get_registered_tools())
-        except ImportError:
-            pass
+        self._registered_tools.update(get_registered_tools())
 
     async def send(self, message: str):
         """Низкоуровневая отправка сообщения в сокет."""
@@ -638,7 +628,7 @@ class AgentSession:
                     f"{self._max_reconnect_attempts}"
                 )
 
-                self.websocket = await websockets.connect(
+                self.websocket = await self._resource.websockets.connect(
                     self._ws_connect_url,
                     ping_interval=20,
                     ping_timeout=20,
@@ -678,3 +668,23 @@ class AgentSession:
                     raise SletClientError(error)
 
                 await asyncio.sleep(self._reconnect_delay)
+
+    def __getattr__(self, name: str) -> AgentSession:
+        """
+        Magic attribute access for sub-agents.
+
+        Usage:
+            session.SubAgentId.connect()
+            session.SubAgentId.chat("hello")
+        """
+        # Avoid infinite recursion for private/dunder attrs
+        if name.startswith("_"):
+            raise AttributeError(name)
+
+        if name in self.sub:
+            return self.sub[name]
+
+        raise AttributeError(
+            f"Sub-agent '{name}' not found. "
+            f"Available: {list(self.sub.keys()) or 'none registered'}"
+        )

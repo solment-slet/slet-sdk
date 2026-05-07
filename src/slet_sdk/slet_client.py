@@ -1,17 +1,18 @@
+from  __future__ import annotations
 import httpx
 import json
 import logging
 from typing import (
     Any,
-    Optional,
     Type,
     TypeVar,
     overload,
+    TYPE_CHECKING,
 )
 
 from pydantic import BaseModel, ValidationError
+import websockets
 
-from slet_sdk.core.typing import LoggerLike
 from slet_sdk.core.schemas import ErrorCode, ErrorResponse
 from slet_sdk.core.exceptions import SletClientError
 from slet_sdk.core.schemas.errors import NetworkError
@@ -22,9 +23,10 @@ from slet_sdk.core.schemas.auth import (
 )
 from slet_sdk.aelite.resources.resource import AeliteResource
 
-T = TypeVar("T", bound=BaseModel)
+if TYPE_CHECKING:
+    from slet_sdk.typing import LoggerLike, WebsocketsModule
 
-BASE_URL = "http://x.net"
+T = TypeVar("T", bound=BaseModel)
 
 
 class SletClient:
@@ -39,19 +41,26 @@ class SletClient:
 
     def __init__(
         self,
-        base_url: str = BASE_URL,
-        timeout: float = 500.0,
+        base_url: str,
+        timeout: float | None = None,
         ssl_verify: bool = True,
-        logger: Optional[LoggerLike] = None,
+        client: httpx.AsyncClient | None = None,
+        transport: httpx.AsyncBaseTransport | None = None,
+        websockets_module: WebsocketsModule = websockets,
+        logger: LoggerLike = logging.getLogger(__name__),
     ):
-        self.logger = logger or logging.getLogger(__name__)
+        self.logger = logger
         self.base_url = base_url
         self.base_ws_url = self.base_url.replace("http://", "ws://").replace(
             "https://", "wss://"
         )
-        self._client = httpx.AsyncClient(
-            base_url=base_url, timeout=httpx.Timeout(timeout), verify=ssl_verify
+        self._client = client if client else httpx.AsyncClient(
+            base_url=base_url,
+            timeout=httpx.Timeout(timeout if timeout else 500.0),
+            verify=ssl_verify,
+            transport=transport,
         )
+        self.websockets = websockets_module
         self.access_token: str | None = None
         self.refresh_token: str | None = None
 
@@ -60,7 +69,7 @@ class SletClient:
 
     # ------------------ Context Manager ------------------
 
-    async def __aenter__(self) -> "SletClient":
+    async def __aenter__(self) -> SletClient:
         # Просто возвращаем себя
         return self
 

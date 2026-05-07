@@ -39,7 +39,7 @@ class TTSResource(BaseResource):
             ConnectionClosed: Если сервер разорвал соединение.
             Exception: При ошибках внутри WebSocket.
         """
-        url = f"{self._base_ws_url}"
+        url = f"{self.base_ws_url}"
 
         # Конфигурация сессии
         session_config = tts_config.model_dump()

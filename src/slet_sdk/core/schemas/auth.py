@@ -52,12 +52,12 @@ class UserInfo(BaseModel):
     """
     Информация о пользователе
     """
+    model_config = ConfigDict(from_attributes=True)
 
     id: int
     name: str
     email: str
 
-    model_config = ConfigDict(from_attributes=True)
 
 
 class UserAuthResponse(UserRefreshResponse):
