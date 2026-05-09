@@ -45,9 +45,9 @@ manifest = AgentManifest(
 
 
 async def main():
-    async with SletClient("http://localhost:8000") as client:
+    async with SletClient("http://localhost:8080") as client:
         # Авторизация
-        await client.signin("tester@gmail.com", "admin12341234G")
+        await client.signin("tester1@gmail.com", "20310482lJSD:Flsdjfls")
 
         # Создание чата
         new_chat = await client.aelite.chats.new_chat()

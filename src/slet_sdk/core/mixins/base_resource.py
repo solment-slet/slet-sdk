@@ -17,10 +17,10 @@ class BaseResource:
     и использует его для HTTP-запросов.
     """
 
-    def __init__(self, client: SletClient) -> None:
+    def __init__(self, client: SletClient, route_prefix: str) -> None:
         self._client = client
+        self._route_prefix = route_prefix
 
-    # Удобные шорткаты к методам клиента
     async def _request(
         self,
         method: str,
@@ -30,7 +30,7 @@ class BaseResource:
     ) -> dict | T:
         return await self._client.request(
             method=method,
-            url=url,
+            url=self._route_prefix + url,
             schema=schema,
             **kwargs,
         )
@@ -45,11 +45,11 @@ class BaseResource:
 
     @property
     def base_url(self) -> str:
-        return self._client.base_url
+        return self._client.base_url + "/" + self._route_prefix
 
     @property
     def base_ws_url(self) -> str:
-        return self._client.base_ws_url
+        return self._client.base_ws_url + "/" + self._route_prefix
 
     @property
     def _access_token(self) -> str | None:

@@ -36,16 +36,16 @@ class UserRegister(BaseModel):
     @field_validator("password")
     def password_strength(cls, v: str) -> str:
         if len(v) < 8:
-            raise ValueError("Пароль должен содержать минимум 8 символов")
+            raise ValueError("Password must contain at least 8 characters")
         if len(v) > 200:
-            raise ValueError("Пароль не может содержать более 200 символов")
+            raise ValueError("Password cannot contain more than 200 characters")
         if not re.search(r"[A-Z]", v):
-            raise ValueError("Пароль должен содержать хотя бы одну заглавную букву")
+            raise ValueError("Password must contain at least one uppercase letter")
         if not re.search(r"[a-z]", v):
-            raise ValueError("Пароль должен содержать хотя бы одну строчную букву")
+            raise ValueError("Password must contain at least one lowercase letter")
         if not re.search(r"[0-9]", v):
-            raise ValueError("Пароль должен содержать хотя бы одну цифру")
-        return v  # обязательно возвращаем значение
+            raise ValueError("Password must contain at least one digit")
+        return v
 
 
 class UserInfo(BaseModel):

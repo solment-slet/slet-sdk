@@ -5,9 +5,7 @@ import logging
 from typing import (
     Any,
     Type,
-    TypeVar,
     overload,
-    TYPE_CHECKING,
 )
 
 from pydantic import BaseModel, ValidationError
@@ -22,11 +20,8 @@ from slet_sdk.core.schemas.auth import (
     UserRefreshResponse,
 )
 from slet_sdk.aelite.resources.resource import AeliteResource
-
-if TYPE_CHECKING:
-    from slet_sdk.typing import LoggerLike, WebsocketsModule
-
-T = TypeVar("T", bound=BaseModel)
+from slet_sdk.typing import LoggerLike, WebsocketsModule
+from slet_sdk.config import ApiPrefixes
 
 
 class SletClient:
@@ -42,15 +37,20 @@ class SletClient:
     def __init__(
         self,
         base_url: str,
+        *,
+        # Network
         timeout: float | None = None,
         ssl_verify: bool = True,
         client: httpx.AsyncClient | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
         websockets_module: WebsocketsModule = websockets,
+        # API
+        api_versions: ApiPrefixes = ApiPrefixes(),
+        # Logging
         logger: LoggerLike = logging.getLogger(__name__),
     ):
         self.logger = logger
-        self.base_url = base_url
+        self.base_url = base_url[:-1] if base_url.endswith("/") else base_url
         self.base_ws_url = self.base_url.replace("http://", "ws://").replace(
             "https://", "wss://"
         )
@@ -61,11 +61,12 @@ class SletClient:
             transport=transport,
         )
         self.websockets = websockets_module
+        self.api_versions = api_versions
         self.access_token: str | None = None
         self.refresh_token: str | None = None
 
         # ── Namespace-ресурсы (продукты) ──────────────────────
-        self.aelite = AeliteResource(self)
+        self.aelite = AeliteResource(self, self.api_versions.aelite)
 
     # ------------------ Context Manager ------------------
 
@@ -91,34 +92,42 @@ class SletClient:
         return {"Authorization": f"Bearer {self.access_token}"}
 
     @overload
-    async def request(
-            self, method: str, url: str, schema: Type[T], **kwargs: Any
+    async def request[T: BaseModel](
+        self,
+        method: str,
+        url: str,
+        schema: type[T],
+        **kwargs: Any,
     ) -> T:
         ...
 
     @overload
     async def request(
-            self, method: str, url: str, schema: None = None, **kwargs: Any
+        self,
+        method: str,
+        url: str,
+        schema: None = None,
+        **kwargs: Any,
     ) -> dict:
         ...
 
-    async def request(
-            self,
-            method: str,
-            url: str,
-            schema: Type[T] | None = None,
-            **kwargs: Any,
+    async def request[T: BaseModel](
+        self,
+        method: str,
+        url: str,
+        schema: Type[T] | None = None,
+        **kwargs: Any,
     ) -> dict | T:
         return await self._request_impl(method, url, schema=schema, **kwargs)
 
-    async def _request_impl(
-            self,
-            method: str,
-            url: str,
-            schema: Type[T] | None = None,
-            *,
-            _skip_refresh: bool = False,
-            **kwargs: Any,
+    async def _request_impl[T: BaseModel](
+        self,
+        method: str,
+        url: str,
+        schema: Type[T] | None = None,
+        *,
+        _skip_refresh: bool = False,
+        **kwargs: Any,
     ) -> dict | T:
         last_resp: httpx.Response | None = None
 
@@ -140,10 +149,10 @@ class SletClient:
                 return self._validate_schema(data, schema, resp.status_code) if schema else data
 
             if (
-                    resp.status_code == 401
-                    and not _skip_refresh
-                    and attempt == 0
-                    and self.refresh_token
+                resp.status_code == 401
+                and not _skip_refresh
+                and attempt == 0
+                and self.refresh_token
             ):
                 err_data = self._parse_json(resp, allow_fail=True)
                 if err_data.get("error") == ErrorCode.INVALID_ACCESS_TOKEN:
@@ -170,7 +179,12 @@ class SletClient:
                 )
             )
 
-    def _validate_schema(self, data: dict, schema: Type[T], status: int) -> T:
+    def _validate_schema[T: BaseModel](
+        self,
+        data: dict,
+        schema: Type[T],
+        status: int
+    ) -> T:
         try:
             return schema.model_validate(data)
         except ValidationError as exc:
@@ -198,7 +212,7 @@ class SletClient:
     async def signin(self, email: str, password: str) -> UserLoginResponse:
         data = await self.request(
             "POST",
-            "/signin",
+            self.api_versions.identify + "/signin",
             schema=UserLoginResponse,
             json={"email": email, "password": password},
         )
@@ -217,7 +231,7 @@ class SletClient:
     async def signup(self, name: str, email: str, password: str) -> UserRegisterResponse:
         data = await self.request(
             "POST",
-            "/signup",
+            self.api_versions.identify + "/signup",
             schema=UserRegisterResponse,
             json={"name": name, "email": email, "password": password},
         )
@@ -237,7 +251,7 @@ class SletClient:
         token = self.refresh_token if refresh_token is None else refresh_token
         data = await self._request_impl(
             "POST",
-            "/refresh",
+            self.api_versions.identify + "/refresh",
             schema=UserRefreshResponse,
             _skip_refresh=True,
             json={"refresh_token": token},

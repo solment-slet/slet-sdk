@@ -43,7 +43,7 @@ class AeliteResource(BaseResource):
 
         return await self._request(
             "POST",
-            f"/ae/agent/deploy/{thread_id}",
+            f"/agent/deploy/{thread_id}",
             schema=AgentDeployResponse,
             json=manifest,
         )
