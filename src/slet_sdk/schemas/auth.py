@@ -1,6 +1,6 @@
 import re
 from pydantic import BaseModel, EmailStr, ConfigDict, field_validator
-from slet_sdk.core.schemas import SuccessResponse
+from slet_sdk.schemas import SuccessResponse
 
 
 class UserRefresh(BaseModel):
@@ -52,12 +52,12 @@ class UserInfo(BaseModel):
     """
     Информация о пользователе
     """
+
     model_config = ConfigDict(from_attributes=True)
 
     id: int
     name: str
     email: str
-
 
 
 class UserAuthResponse(UserRefreshResponse):

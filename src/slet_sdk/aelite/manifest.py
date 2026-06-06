@@ -1,234 +1,1086 @@
+"""
+manifest.py — Declarative agent configuration schema.
+
+This module defines the complete Pydantic model hierarchy used to describe
+an agent and all its runtime behaviour: LLM parameters, persistent memory,
+RAG retrieval, node-level caching, A-MEM knowledge graph, dynamic tool
+retrieval, tool inheritance, triggers, and peripheral components.
+
+A manifest is submitted once via ``POST /agent/deploy/{thread_id}``,
+serialised to Redis, and used by ``AgentFactory`` to compile a LangGraph
+graph that is cached in memory per replica.  Sub-agents are fully recursive —
+each sub-agent is itself an ``AgentManifest`` and is deployed as an
+independent entity with its own ``thread_id`` and WebSocket endpoint.
+
+Credential handling
+-------------------
+Fields that may contain sensitive connection strings (``connection_url``)
+are marked ``exclude=True`` so they are never written to Redis or returned
+in API responses.  Prefer ``connection_url_env`` (the name of a server-side
+environment variable) over inline credentials.
+
+System-prompt variables
+-----------------------
+The following placeholders are expanded before every LLM call:
+
+- ``{time}``            — current server time (always available)
+- ``{summary}``         — rolling conversation summary
+                          (requires ``memory.enabled = True`` and
+                          ``memory.summarization`` set to ``'async'``
+                          or ``'blocking'``)
+- ``{amem}``            — A-MEM knowledge-graph notes
+                          (requires ``memory.agentic.enabled = True``;
+                          variable name overridable via ``inject_variable``)
+- ``{rag_<name>}``      — RAG chunks for the source whose ``name`` field
+                          equals ``<name>`` (requires ``rag.enabled = True``
+                          and ``inject_as = 'system_variable'``)
+
+Unknown placeholders produce an inline error note instead of crashing.
+"""
+
 from __future__ import annotations
+
 from typing import Any, Literal
-from pydantic import BaseModel, Field, model_validator
+from enum import Enum
+
+from pydantic import BaseModel, Field, model_validator, field_validator
+
+# ===========================================================================
+# Broadcast
+# ===========================================================================
 
 
-class TriggerConfig(BaseModel):
+class BroadcastMode(str, Enum):
     """
-    Defines an event that can autonomously invoke the agent without a direct user message.
+    Determines how the server collects responses from connected WebSocket
+    clients when a client tool is invoked in broadcast mode.
 
-    Triggers allow the agent to react to external events (client-side UI events,
-    scheduled jobs, or internal system signals) by injecting a predefined prompt
-    into the conversation as if the user had sent it.
-    """
-
-    name: str = Field(
-        description="Unique trigger identifier used to fire it via WebSocket: {type: 'trigger', name: '...'}."
-    )
-    type: Literal["client_event", "cron", "system"] = Field(
-        description=(
-            "Trigger source type:\n"
-            "  - 'client_event': fired explicitly by the client over WebSocket.\n"
-            "  - 'cron': scheduled recurring trigger (handled server-side).\n"
-            "  - 'system': fired by internal infrastructure events."
-        )
-    )
-    condition: str = Field(
-        description="Human-readable description of when this trigger should fire. Used for documentation and future rule evaluation."
-    )
-    action_prompt: str = Field(
-        description=(
-            "The text injected into the conversation as a HumanMessage when this trigger fires. "
-            "Instructs the agent what to do in response to the event."
-        )
-    )
-
-
-class ToolParam(BaseModel):
-    """
-    Schema definition for a single parameter of a client-side tool.
-
-    Used to dynamically build the Pydantic args schema that LangChain exposes
-    to the LLM in the tool's JSON Schema — so the LLM knows what arguments to pass.
+    Modes
+    -----
+    disabled
+        Broadcast is off. The tool call is delivered only to the connection
+        that triggered the current agent run (via ``current_websocket``).
+    first
+        The server resolves as soon as **any single** client responds.
+        Remaining responses are silently discarded. Lowest latency option.
+    collect
+        The server waits for the first response, then holds the result open
+        for an additional ``collect_window`` seconds to gather stragglers
+        before resolving. Good balance between completeness and latency.
+    threshold
+        The server waits until at least ``threshold_percent`` % of currently
+        connected clients have responded, then waits an additional
+        ``collect_window`` seconds before resolving.
+        Example: 3 clients connected, ``threshold_percent=67`` → waits for 2.
+    all
+        The server waits for **every** connected client to respond or for
+        ``timeout`` to expire, whichever comes first. Guarantees full
+        participation when all clients are reliable; use with a generous
+        ``timeout``.
     """
 
-    type: Literal["str", "int", "float", "bool"] = Field(
-        description="Python primitive type of this parameter."
-    )
-    description: str | None = Field(
-        default=None,
-        description=(
-            "Human-readable description of the parameter shown to the LLM in the tool schema. "
-            "Optional — if omitted, the LLM receives no guidance for this parameter."
-        )
-    )
-    default: Any = Field(
-        default=None,
-        description="Default value used when the parameter is optional and the LLM omits it."
-    )
-    required: bool = Field(
-        default=True,
-        description=(
-            "Whether the LLM must always provide this parameter. "
-            "If False and 'default' is set, the parameter becomes optional in the generated schema."
-        )
-    )
+    disabled = "disabled"
+    first = "first"
+    collect = "collect"
+    threshold = "threshold"
+    all = "all"
 
 
-class ToolConfig(BaseModel):
+class BroadcastConfig(BaseModel):
     """
-    Declares a tool the agent can invoke during reasoning.
+    Configuration for broadcast client tool calls.
 
-    Two tool types are supported:
-      - 'server': implemented server-side (e.g. get_time, search). Resolved by AgentFactory._get_server_tool.
-      - 'client': executed client-side over WebSocket. The server sends a 'client_tool_call' event
-                  and waits up to 300s for the client to respond with 'client_tool_result'.
+    When a client tool is invoked in broadcast mode, the server publishes a
+    ``client_tool_call`` event to **all** WebSocket connections on the current
+    ``thread_id`` (across all pods via Redis pub/sub) and then aggregates the
+    responses according to ``mode`` before returning a single string to the LLM.
+
+    The aggregated result always follows this format::
+
+        [BROADCAST] Received {n}/{total} response(s):
+          [1] <result>
+          [2] <result>
+          (k client(s) did not respond within {timeout}s)  # if any timed out
+
+    Notes
+    -----
+    - ``expected`` is snapshot at call time: the number of active WebSocket
+      connections to ``thread_id`` when the tool is invoked. Clients that
+      connect or disconnect mid-call are not accounted for.
+    - ``collect_window`` is only meaningful for ``collect`` and ``threshold``
+      modes; it is ignored for ``first``, ``all``, and ``disabled``.
+    - ``threshold_percent`` is only meaningful for ``threshold`` mode.
+    - The overall deadline is always ``timeout`` seconds regardless of mode.
+      ``collect_window`` cannot extend beyond it.
     """
 
-    name: str = Field(
-        description="Tool identifier. Must be unique within the agent. Used as the function name exposed to the LLM."
-    )
-    type: Literal["server", "client"] = Field(
+    mode: BroadcastMode = Field(
+        default=BroadcastMode.disabled,
         description=(
-            "Execution location:\n"
-            "  - 'server': runs in the backend process.\n"
-            "  - 'client': sends a WebSocket event and awaits the client's response."
-        )
+            "Response collection strategy. See ``BroadcastMode`` for full "
+            "semantics of each option."
+        ),
     )
-    description: str | None = Field(
-        default=None,
+    timeout: float = Field(
+        default=30.0,
+        gt=0,
         description=(
-            "Explains to the LLM what this tool does and when to use it. "
-            "Critical for correct tool selection — keep it concise and unambiguous."
-        )
+            "Hard deadline in seconds for the entire broadcast round-trip: "
+            "from sending ``client_tool_call`` to returning the aggregated "
+            "result to the LLM. Clients that have not responded by this time "
+            "are counted as non-respondents in the summary."
+        ),
     )
-    params: dict[str, ToolParam] = Field(
-        default_factory=dict,
-        description="Named parameters this tool accepts. Dynamically compiled into a Pydantic schema for LangChain."
+    collect_window: float = Field(
+        default=5.0,
+        gt=0,
+        description=(
+            "Extra seconds to wait for additional responses after the primary "
+            "condition is met (first response for ``collect``, threshold reached "
+            "for ``threshold``). Capped by the remaining ``timeout`` budget. "
+            "Ignored in ``first``, ``all``, and ``disabled`` modes."
+        ),
     )
-    broadcast: bool = Field(
+    threshold_percent: float = Field(
+        default=50.0,
+        description=(
+            "Minimum percentage of connected clients that must respond before "
+            "the server moves to the ``collect_window`` phase. Only used in "
+            "``threshold`` mode. Must be in the range (0, 100]. "
+            "Example: 4 clients connected, ``threshold_percent=75`` → waits "
+            "for at least 3 responses."
+        ),
+    )
+    include_client_id: bool = Field(
         default=False,
         description=(
-            "Controls which WebSocket connections receive the 'client_tool_call' event:\n"
-            "  - False (default): sent only to the connection that triggered the current agent run.\n"
-            "  - True: broadcast to all connections currently subscribed to this thread_id.\n"
-            "Use True for shared-state tools (e.g. updating a UI element visible to all participants)."
-        )
+            "When ``True``, each response line in the aggregated result is "
+            "prefixed with the client's identifier as reported in the "
+            "``client_tool_result`` payload. Useful when the LLM needs to "
+            "attribute responses to specific participants."
+        ),
     )
 
+    @field_validator("threshold_percent")
+    @classmethod
+    def validate_threshold(cls, v: float) -> float:
+        if not 0 < v <= 100:
+            raise ValueError("threshold_percent must be in the range (0, 100]")
+        return v
 
-class MemoryConfig(BaseModel):
-    """
-    Controls the agent's persistent memory behaviour.
 
-    Memory is implemented as a combination of:
-      - Full message history stored in the LangGraph checkpoint (PostgreSQL).
-      - A rolling summary stored separately in SummaryStore (Redis + PostgreSQL).
-
-    When the message count exceeds 'threshold', older messages are trimmed.
-    If summarization is enabled, the trimmed messages are condensed into a
-    summary that is injected into the system prompt on every subsequent request.
-    """
-
-    enabled: bool = Field(
-        default=True,
-        description=(
-            "Master switch for persistent memory. "
-            "When False, the agent operates statelessly — no checkpoint is written "
-            "and no summary is maintained. Each request starts with a blank slate."
-        )
-    )
-    summarization: Literal["async", "blocking", "disabled"] = Field(
-        default="disabled",
-        description=(
-            "Summarization strategy applied after each agent response:\n"
-            "  - 'disabled': only trims old messages (no LLM summarization). "
-            "Fast, but the agent loses context beyond 'keep_last' turns.\n"
-            "  - 'blocking': awaits summarization before the next message can be processed. "
-            "Guarantees the next request sees the updated summary. "
-            "In sequential mode this extends the lock duration.\n"
-            "  - 'async': summarization runs as a background task (fire-and-forget). "
-            "The next request may read a slightly stale summary — acceptable for most use cases.\n\n"
-            "Note: in sequential mode the processing lock is held for the full summarization "
-            "duration regardless of this setting, so 'async' only meaningfully differs in parallel mode."
-        )
-    )
-    threshold: int = Field(
-        default=6,
-        description=(
-            "Number of conversation turns (HumanMessage boundaries) that must accumulate "
-            "before trimming and optional summarization are triggered. "
-            "Lower values = more frequent summarization, shorter context windows."
-        )
-    )
-    keep_last: int = Field(
-        default=3,
-        description=(
-            "Number of most recent turns to preserve verbatim after trimming. "
-            "These messages remain in the checkpoint and are visible to the LLM in full. "
-            "Must be less than 'threshold'."
-        )
-    )
+# ===========================================================================
+# Model
+# ===========================================================================
 
 
 class ModelConfig(BaseModel):
     """
     Per-agent LLM sampling parameters.
 
-    All fields are optional. When omitted, the model_manager's global defaults are used.
-    Useful for fine-tuning individual agents in a multi-agent setup
-    (e.g. a low-temperature agent for structured extraction alongside a creative one).
+    All fields are optional — when omitted, the global defaults configured
+    in ``model_manager`` are used.
     """
 
     temperature: float | None = Field(
         default=None,
-        description="Sampling temperature. Lower = more deterministic. Typical range: 0.0–1.0."
+        ge=0.0,
+        le=2.0,
+        description=(
+            "Sampling temperature.  Lower values produce more deterministic "
+            "output; higher values increase diversity.  Typical range: "
+            "0.0 (greedy) to 1.0 (balanced)."
+        ),
     )
     top_p: float | None = Field(
         default=None,
-        description="Nucleus sampling threshold. Alternative to temperature; controls diversity."
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Nucleus sampling threshold.  Tokens are sampled from the smallest "
+            "set whose cumulative probability exceeds ``top_p``.  Avoid setting "
+            "both ``temperature`` and ``top_p`` simultaneously."
+        ),
     )
     max_completion_tokens: int | None = Field(
         default=None,
-        description="Hard cap on the number of tokens the model may generate per response."
+        ge=1,
+        description=(
+            "Hard cap on the number of tokens the model may generate per "
+            "response.  Prevents runaway generation on open-ended prompts."
+        ),
     )
+
+
+# ===========================================================================
+# RAG — Retrieval-Augmented Generation
+# ===========================================================================
+
+
+class RAGSource(BaseModel):
+    """
+    A single vector-store data source used for retrieval.
+
+    An agent may declare multiple sources; retrieval requests are issued to
+    all of them in parallel and the results are merged by the configured
+    ``RerankerConfig`` before being injected into the context.
+
+    Connection resolution order:
+    1. ``connection_url`` (inline, excluded from serialisation)
+    2. ``connection_url_env`` → ``os.environ[connection_url_env]``
+    3. Environment variable ``RAG_{BACKEND}_URL`` (e.g. ``RAG_QDRANT_URL``)
+    4. For ``backend = 'redis'`` only: fall back to the server-managed Redis
+       client (``common.redis``).
+    """
+
+    name: str = Field(
+        description=(
+            "Logical source identifier.  Used as the suffix in the system-prompt "
+            "variable ``{rag_<name>}`` when ``inject_as = 'system_variable'``, "
+            "and as the tool name ``<name>_search`` when ``inject_as = 'tool'``.  "
+            "Must be unique within the agent's ``rag.sources`` list."
+        ),
+    )
+    backend: Literal["pgvector", "qdrant", "chroma", "redis"] = Field(
+        description=(
+            "Vector-store backend to query.  Each backend requires its own "
+            "Python package to be installed on the server:\n"
+            "  - ``'pgvector'``: PostgreSQL + pgvector extension (``asyncpg``).\n"
+            "  - ``'qdrant'``: Qdrant vector database (``qdrant-client``).\n"
+            "  - ``'chroma'``: ChromaDB (``chromadb``).\n"
+            "  - ``'redis'``: Redis Stack with vector-similarity search (``redis``)."
+        ),
+    )
+    collection: str = Field(
+        description=(
+            "Collection, index, or table name inside the backend.  Interpretation "
+            "is backend-specific: a Qdrant collection name, a pgvector table name, "
+            "a Chroma collection, or a Redis index name."
+        ),
+    )
+    connection_url: str | None = Field(
+        default=None,
+        exclude=True,
+        description=(
+            "Full connection URL for the backend (e.g. ``postgresql+asyncpg://...``, "
+            "``http://qdrant-host:6333``).  Excluded from serialisation — prefer "
+            "``connection_url_env`` to avoid storing credentials in Redis."
+        ),
+    )
+    connection_url_env: str | None = Field(
+        default=None,
+        description=(
+            "Name of a server-side environment variable that holds the connection "
+            "URL.  Resolved at retrieval time via ``os.environ[connection_url_env]``.  "
+            "Safer than ``connection_url`` because the value never leaves the "
+            "server process."
+        ),
+    )
+    top_k: int = Field(
+        default=5,
+        ge=1,
+        le=50,
+        description=(
+            "Maximum number of chunks to retrieve from this source per query.  "
+            "The reranker may reduce the final count further via ``top_n``."
+        ),
+    )
+    score_threshold: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Minimum cosine-similarity score.  Chunks below this threshold are "
+            "discarded before reranking.  ``None`` disables score filtering — "
+            "all ``top_k`` results are kept regardless of quality."
+        ),
+    )
+    namespace: str | None = Field(
+        default=None,
+        description=(
+            "Optional namespace or tenant key applied as a metadata filter on "
+            "every query.  Useful for multi-tenant deployments where a single "
+            "collection stores documents for multiple customers."
+        ),
+    )
+    metadata_filter: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Static metadata filter applied to every query against this source.  "
+            "Format is backend-specific:\n"
+            "  - Qdrant: ``{'must': [{'key': 'lang', 'match': {'value': 'en'}}]}``\n"
+            "  - pgvector: key-value pairs passed as WHERE-clause fragments.\n"
+            "  - Chroma: ``{'lang': {'$eq': 'en'}}``"
+        ),
+    )
+    embed_query_template: str | None = Field(
+        default=None,
+        description=(
+            "Template applied to the raw query text before embedding.  "
+            "``{query}`` is replaced with the actual query.  Useful for query "
+            "expansion (e.g. ``'Represent this question for retrieval: {query}'``) "
+            "or HyDE (Hypothetical Document Embeddings)."
+        ),
+    )
+    inject_as: Literal["system_variable", "tool"] = Field(
+        default="system_variable",
+        description=(
+            "How retrieved chunks are exposed to the LLM:\n"
+            "  - ``'system_variable'``: chunks are inserted into the system "
+            "prompt via ``{rag_<name>}``.  The LLM always sees the retrieved "
+            "context.\n"
+            "  - ``'tool'``: a server-side tool ``<name>_search`` is registered "
+            "dynamically.  The LLM decides when to call it.  Saves tokens when "
+            "retrieval is only occasionally needed."
+        ),
+    )
+    tool_description: str | None = Field(
+        default=None,
+        description=(
+            "Description shown to the LLM when ``inject_as = 'tool'``.  Should "
+            "explain when to call this tool and what kinds of questions it can "
+            "answer.  If ``None``, a generic description is generated from the "
+            "source ``name``."
+        ),
+    )
+
+
+class RerankerConfig(BaseModel):
+    """
+    Post-retrieval reranking applied after all ``RAGSource`` results are
+    collected.  Results from multiple sources are pooled before reranking
+    so the final ``top_n`` chunks represent the best matches overall.
+    """
+
+    type: Literal["cross_encoder", "llm", "rrf", "none"] = Field(
+        default="none",
+        description=(
+            "Reranking algorithm:\n"
+            "  - ``'none'``: concatenate in source order, truncate to ``top_n``.\n"
+            "  - ``'rrf'``: Reciprocal Rank Fusion — fast, no neural model.\n"
+            "  - ``'cross_encoder'``: local cross-encoder model (``sentence-transformers``).\n"
+            "  - ``'llm'``: primary LLM acts as a relevance judge.  Most accurate "
+            "but expensive."
+        ),
+    )
+    model: str | None = Field(
+        default=None,
+        description=(
+            "Model identifier for ``'cross_encoder'`` and ``'llm'`` rerankers.  "
+            "For cross-encoders, a HuggingFace model name "
+            "(e.g. ``'cross-encoder/ms-marco-MiniLM-L-6-v2'``).  "
+            "Ignored for ``'rrf'`` and ``'none'``."
+        ),
+    )
+    top_n: int = Field(
+        default=3,
+        ge=1,
+        description=(
+            "Number of chunks to retain after reranking.  The final context "
+            "contains at most ``top_n`` chunks regardless of how many sources "
+            "contributed."
+        ),
+    )
+
+
+class RAGConfig(BaseModel):
+    """
+    Retrieval-Augmented Generation configuration.
+
+    When enabled, ``RAGService`` issues parallel queries to all declared
+    sources, merges results through the reranker, and makes chunks available
+    to the LLM either via system-prompt injection or dynamic search tools.
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "Master switch.  When ``False``, no retrieval is performed and "
+            "``{rag_*}`` placeholders expand to empty strings."
+        ),
+    )
+    sources: list[RAGSource] = Field(
+        default_factory=list,
+        description=(
+            "Ordered list of vector-store sources.  Queries are issued to all "
+            "sources in parallel.  At least one source is required when "
+            "``enabled = True``."
+        ),
+    )
+    reranker: RerankerConfig = Field(
+        default_factory=RerankerConfig,
+        description=(
+            "Reranking strategy applied after all source results are collected.  "
+            "Defaults to ``type = 'none'`` (concatenate and truncate)."
+        ),
+    )
+    query_mode: Literal["last_message", "summary", "custom_tool"] = Field(
+        default="last_message",
+        description=(
+            "What text is used as the retrieval query:\n"
+            "  - ``'last_message'``: content of the most recent HumanMessage.\n"
+            "  - ``'summary'``: current rolling summary from ``SummaryStore``.  "
+            "Useful when relevant context spans many turns.\n"
+            "  - ``'custom_tool'``: retrieval is not triggered automatically; "
+            "the agent calls ``<name>_search`` tools explicitly.  Requires all "
+            "sources to use ``inject_as = 'tool'``."
+        ),
+    )
+    max_tokens_per_source: int | None = Field(
+        default=2000,
+        ge=100,
+        description=(
+            "Hard token limit for the context injected per source.  Chunks are "
+            "trimmed (not dropped) to fit.  ``None`` disables trimming.  Does "
+            "not apply to sources with ``inject_as = 'tool'``."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def validate_sources_present(self):
+        if self.enabled and not self.sources:
+            raise ValueError("rag.enabled=True requires at least one source.")
+        if self.query_mode == "custom_tool":
+            if any(s.inject_as != "tool" for s in self.sources):
+                raise ValueError(
+                    "query_mode='custom_tool' requires all sources inject_as='tool'."
+                )
+        return self
+
+
+# ===========================================================================
+# Cache
+# ===========================================================================
+
+
+class NodeCachePolicy(BaseModel):
+    """
+    LangGraph ``CachePolicy`` settings for a single graph node.
+
+    Controls whether (and for how long) a node's output is cached based on
+    its input state.  A cache hit skips the node function entirely, returning
+    the cached output directly.
+    """
+
+    ttl: int | None = Field(
+        default=300,
+        ge=1,
+        description=(
+            "Cache entry time-to-live in seconds.  After this period the entry "
+            "is evicted and the node re-executes on the next request.  ``None`` "
+            "means entries never expire — use only for truly static computations."
+        ),
+    )
+    key_fields: list[str] | None = Field(
+        default=None,
+        description=(
+            "State field paths included in the cache key.  Each entry is a "
+            "dot-notation accessor evaluated against the node's input state "
+            "(e.g. ``'messages[-1].content'``).  ``None`` uses the full "
+            "serialised state hash — safe but may have a lower hit rate when "
+            "irrelevant fields change between requests."
+        ),
+    )
+
+
+class CacheConfig(BaseModel):
+    """
+    Multi-layer caching configuration.
+
+    Two independent layers are configured here:
+
+    1. **Node cache**: LangGraph-level ``CachePolicy`` on individual graph
+       nodes (``rag_retrieval``, ``amem_retrieval``).  The shared cache
+       backend is selected via ``backend``.
+
+    2. **Prompt cache**: provider-side prefix caching (Anthropic
+       ``cache_control``).  The static portion of the system prompt is
+       billed at ~10% of the normal input-token rate on cache hits.
+    """
+
+    backend: Literal["memory", "sqlite", "redis"] = Field(
+        default="memory",
+        description=(
+            "Storage backend for the LangGraph node cache:\n"
+            "  - ``'memory'``: ``InMemoryCache`` — process-local, not shared "
+            "across replicas.  Cannot be combined with ``InMemorySaver``.\n"
+            "  - ``'sqlite'``: ``SqliteCache`` — file-based, single-process.\n"
+            "  - ``'redis'``: ``RedisCache`` — shared across replicas.  "
+            "Recommended for production."
+        ),
+    )
+    prompt_cache: bool = Field(
+        default=False,
+        description=(
+            "Enable provider-side prompt prefix caching.  When ``True``, the "
+            "static prefix of the system prompt (everything before the first "
+            "``{variable}``) is annotated with ``cache_control: ephemeral`` on "
+            "Anthropic models, reducing input-token costs by ~90% on cache hits."
+        ),
+    )
+    rag_retrieval: NodeCachePolicy | None = Field(
+        default_factory=lambda: NodeCachePolicy(ttl=300),
+        description=(
+            "Cache policy for the ``rag_retrieval`` graph node.  A cache hit "
+            "skips the vector-store query, returning previously retrieved chunks "
+            "for the same query text.  ``None`` disables caching for this node."
+        ),
+    )
+    amem_retrieval: NodeCachePolicy | None = Field(
+        default_factory=lambda: NodeCachePolicy(ttl=60),
+        description=(
+            "Cache policy for the ``amem_read`` graph node.  A cache hit skips "
+            "the knowledge-graph vector search, reusing previously retrieved "
+            "notes.  Write operations are never cached.  ``None`` disables."
+        ),
+    )
+
+
+# ===========================================================================
+# Tool Retriever
+# ===========================================================================
+
+
+class ToolRetrieverConfig(BaseModel):
+    """
+    Controls dynamic tool selection via semantic retrieval.
+
+    When an agent has many tools, sending all their JSON schemas on every LLM
+    call wastes tokens.  The tool retriever embeds each tool's description at
+    compile time, then selects only the top-K most relevant tools per request
+    based on cosine similarity to the user's query.
+
+    Set ``enabled = False`` (default) to always send all tools to the LLM.
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "Master switch.  When ``False``, all tools are sent to the LLM on "
+            "every call.  No embedding overhead, no filtering.  Recommended "
+            "when the agent has fewer than ``min_tools_to_activate`` tools."
+        ),
+    )
+    top_k: int = Field(
+        default=5,
+        ge=1,
+        description=(
+            "Maximum number of tools selected per request, excluding tools "
+            "listed in ``always_on``.  The LLM receives at most "
+            "``top_k + len(always_on)`` tool schemas per call."
+        ),
+    )
+    min_tools_to_activate: int = Field(
+        default=8,
+        ge=2,
+        description=(
+            "Minimum total tool count required to activate dynamic retrieval.  "
+            "Below this threshold, the embedding and cosine-search overhead "
+            "exceeds the token savings, so all tools are sent directly."
+        ),
+    )
+    always_on: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Exact tool names that are always included in every request, never "
+            "filtered by the retriever.  Use for tools the user might need "
+            "regardless of context, such as ``['cancel', 'help', 'handoff']``.  "
+            "These tools bypass similarity scoring entirely."
+        ),
+    )
+    cache: NodeCachePolicy | None = Field(
+        default_factory=lambda: NodeCachePolicy(ttl=120),
+        description=(
+            "Cache policy for the ``tool_retriever`` graph node.  A cache hit "
+            "reuses the previously selected tool set for the same query text "
+            "without re-embedding.  ``None`` disables caching — the retriever "
+            "runs on every request."
+        ),
+    )
+
+
+# ===========================================================================
+# A-MEM — Agentic Memory
+# ===========================================================================
+
+
+class AMEMPromptConfig(BaseModel):
+    """
+    Prompt configuration for A-MEM note extraction and evolution.
+
+    Overriding the default prompts to
+    tailor memory behaviour to a specific domain.
+    """
+
+    note_extraction_prompt: str | None = Field(
+        default=None,
+        description=(
+            "Override the default note extraction prompt. When ``None``, "
+            "the built-in prompt is used. Must instruct the model to return "
+            "a JSON object with fields: ``insight``, ``entities``, ``tags``, "
+            "``source_summary``. Supports two placeholders:\n"
+            "  - ``{dialogue}``: the formatted conversation turns.\n"
+            "  - ``{existing_notes}``: recently retrieved notes for "
+            "deduplication context."
+        ),
+    )
+    evolution_prompt: str | None = Field(
+        default=None,
+        description=(
+            "Override the default evolution/conflict-detection prompt. "
+            "When ``None``, the built-in prompt is used. Must instruct the "
+            "model to return a JSON object with fields: ``relationship``, "
+            "``should_update_existing``, ``updated_insight``, ``explanation``. "
+            "Supports two placeholders:\n"
+            "  - ``{new_insight}``: the newly extracted note insight.\n"
+            "  - ``{existing_insight}``: the existing note insight being compared."
+        ),
+    )
+
+
+class AMEMConfig(BaseModel):
+    """
+    Agentic Memory (A-MEM) configuration.
+
+    A-MEM builds a persistent knowledge graph on top of the standard rolling
+    summary.  After each agent response, an LLM analyses the exchange and
+    produces a structured note — a concise insight with entities, tags, and
+    links to related past notes.
+
+    Unlike the rolling summary (linear compression of recent history), A-MEM
+    captures cross-session knowledge and explicit relationships between
+    concepts, users, and outcomes.
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "Master switch.  When ``False``, no A-MEM reads or writes are "
+            "performed and the ``{amem}`` placeholder expands to an empty string."
+        ),
+    )
+    graph_backend: Literal["redis", "neo4j", "in_memory"] = Field(
+        default="redis",
+        description=(
+            "Storage backend for the knowledge graph:\n"
+            "  - ``'redis'``: Redis Stack with vector-similarity search.  "
+            "Recommended — no extra infrastructure if Redis is already in use.\n"
+            "  - ``'neo4j'``: native graph database.  Better for complex "
+            "multi-hop relationship queries.\n"
+            "  - ``'in_memory'``: ephemeral dict-based store.  Notes are lost "
+            "on process restart.  Testing only."
+        ),
+    )
+    connection_url: str | None = Field(
+        default=None,
+        exclude=True,
+        description=(
+            "Connection URL for the A-MEM backend (e.g. ``redis://...``, "
+            "``bolt://neo4j:7687``).  Excluded from serialisation.  When "
+            "``None`` and ``graph_backend = 'redis'``, the server-managed "
+            "Redis client is used."
+        ),
+    )
+    connection_url_env: str | None = Field(
+        default=None,
+        description=(
+            "Name of a server-side environment variable holding the connection "
+            "URL.  Resolved at runtime via ``os.environ[connection_url_env]``."
+        ),
+    )
+    write_mode: Literal["async", "blocking", "disabled"] = Field(
+        default="async",
+        description=(
+            "When and how note creation runs after an agent response:\n"
+            "  - ``'async'``: fire-and-forget background task.  Response is "
+            "delivered immediately; note creation runs in the background.\n"
+            "  - ``'blocking'``: ``await`` the write before releasing the "
+            "processing lock.  Guarantees the next request sees the new note.\n"
+            "  - ``'disabled'``: notes are never created.  Reads from existing "
+            "notes still work."
+        ),
+    )
+    note_creation: Literal["auto", "on_tool_use", "disabled"] = Field(
+        default="auto",
+        description=(
+            "Trigger condition for creating a new note:\n"
+            "  - ``'auto'``: after every completed exchange (Human → AI).\n"
+            "  - ``'on_tool_use'``: only when at least one tool was invoked.  "
+            "Reduces graph growth for simple conversational turns.\n"
+            "  - ``'disabled'``: no new notes are created.  Useful for "
+            "read-only agents consuming a shared knowledge graph."
+        ),
+    )
+    link_extraction: bool = Field(
+        default=True,
+        description=(
+            "When ``True``, the note-creation step also identifies semantic "
+            "links between the new note and existing notes in the graph "
+            "(e.g. 'refines', 'contradicts', 'extends').  Disable to reduce "
+            "write latency if relationship traversal is not needed."
+        ),
+    )
+    evolution: bool = Field(
+        default=True,
+        description=(
+            "When ``True``, existing notes that are contradicted or superseded "
+            "by a new note are updated in place.  The LLM compares the new "
+            "insight against similar existing notes and performs an upsert "
+            "when a conflict is detected.  Disable if immutability of past "
+            "notes is required."
+        ),
+    )
+    retrieval_top_k: int = Field(
+        default=5,
+        ge=1,
+        le=20,
+        description=(
+            "Number of notes retrieved from the knowledge graph per request.  "
+            "Higher values provide richer context but consume more prompt tokens."
+        ),
+    )
+    inject_variable: str = Field(
+        default="amem",
+        description=(
+            "Name of the system-prompt placeholder that receives retrieved "
+            "notes (e.g. ``'amem'`` → ``{amem}``).  Override when the default "
+            "name conflicts with another placeholder."
+        ),
+    )
+    evolution_similarity_threshold: float = Field(
+        default=0.75,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Minimum cosine similarity score required before running the "
+            "evolution LLM call against an existing note. Notes below this "
+            "threshold are considered unrelated and skipped. Prevents "
+            "spurious updates from weakly related notes. Range: 0.0–1.0."
+        ),
+    )
+    scope: Literal[
+        "thread",
+        "thread_user",
+        "agent",
+        "agent_user",
+        "system_agent",
+        "system_agent_user",
+        "system_thread",
+        "system_thread_user",
+    ] = Field(
+        default="thread",
+        description=(
+            "Visibility scope of the A-MEM knowledge graph. Controls which "
+            "namespace notes are written to and read from.\n\n"
+            "  - ``'thread'``: notes are private to the current ``thread_id``. "
+            "Each conversation starts with clean memory.\n"
+            "  - ``'thread_user'``: notes are scoped to both ``thread_id`` and "
+            "``user_id``. Adds explicit user isolation on top of thread isolation.\n"
+            "  - ``'agent'``: notes are shared across all users and all threads "
+            "of this agent. Use for shared knowledge bases and FAQ accumulation.\n"
+            "  - ``'agent_user'``: notes are shared across all threads of this "
+            "agent for the same user, isolated from other users. Recommended "
+            "scope for personal assistants — the user carries memory into every "
+            "new conversation.\n"
+            "  - ``'system_agent'``: notes are shared across all agents in this "
+            "multi-agent system (identified by ``root_agent_id``) across all "
+            "users and threads. All supervisor and worker agents share one pool.\n"
+            "  - ``'system_agent_user'``: same as ``'system_agent'`` but isolated "
+            "per user. All agents in the system share memory for a given user, "
+            "other users are isolated.\n"
+            "  - ``'system_thread'``: notes are shared across all agents in this "
+            "multi-agent system within a single root conversation (identified by "
+            "``root_thread_id``). Different conversations are isolated.\n"
+            "  - ``'system_thread_user'``: same as ``'system_thread'`` but with "
+            "additional user isolation on top of root thread isolation."
+        ),
+    )
+    model: ModelConfig = Field(
+        default_factory=ModelConfig,
+        description=(
+            "Model configuration for A-MEM LLM calls. "
+            "Controls which model is used for note extraction and evolution."
+        ),
+    )
+    prompt: AMEMPromptConfig = Field(
+        default_factory=AMEMPromptConfig,
+        description=(
+            "Prompt configuration for A-MEM LLM calls. "
+            "Allows overriding the default prompts."
+        ),
+    )
+
+
+# ===========================================================================
+# Memory
+# ===========================================================================
+
+
+class MemoryConfig(BaseModel):
+    """
+    Persistent memory configuration combining rolling summary and A-MEM.
+
+    **Rolling summary** (``summarization`` + ``threshold`` + ``keep_last``):
+    A compact linear digest of older turns.  When the message count exceeds
+    ``threshold``, oldest turns are trimmed; if ``summarization != 'disabled'``,
+    an LLM produces a summary stored in ``SummaryStore`` and injected via
+    ``{summary}``.
+
+    **A-MEM** (``agentic``): A persistent cross-session knowledge graph.
+    Operates independently of the rolling summary — they complement each
+    other: summary provides recency, A-MEM provides depth.
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description=(
+            "Master switch for persistent memory.  When ``False``, the agent is "
+            "fully stateless: no checkpoint is written, no summary is maintained, "
+            "and A-MEM is suppressed regardless of ``agentic.enabled``."
+        ),
+    )
+    summarization: Literal["async", "blocking", "disabled"] = Field(
+        default="disabled",
+        description=(
+            "LLM-based summarisation strategy after each response:\n"
+            "  - ``'disabled'``: old messages are trimmed but no summary is "
+            "generated.  Context beyond ``keep_last`` turns is lost.\n"
+            "  - ``'async'``: fire-and-forget background task.  The next "
+            "request may read a slightly stale summary.\n"
+            "  - ``'blocking'``: awaits summarisation before releasing the "
+            "processing lock.  Guarantees freshness but adds latency."
+        ),
+    )
+    threshold: int = Field(
+        default=6,
+        ge=2,
+        description=(
+            "Number of conversation turns (counted by HumanMessage boundaries) "
+            "that must accumulate before trimming and optional summarisation "
+            "are triggered."
+        ),
+    )
+    keep_last: int = Field(
+        default=3,
+        ge=1,
+        description=(
+            "Number of most recent turns preserved verbatim after trimming.  "
+            "These turns remain fully visible to the LLM.  Must be strictly "
+            "less than ``threshold``."
+        ),
+    )
+    agentic: AMEMConfig = Field(
+        default_factory=AMEMConfig,
+        description=(
+            "A-MEM knowledge-graph settings.  Operates as a separate memory "
+            "layer on top of the rolling summary.  Requires "
+            "``memory.enabled = True``."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def validate_keep_last(self):
+        if self.keep_last >= self.threshold:
+            raise ValueError(
+                f"keep_last ({self.keep_last}) must be strictly less than "
+                f"threshold ({self.threshold})."
+            )
+        if self.agentic.enabled and not self.enabled:
+            raise ValueError("agentic.enabled=True requires memory.enabled=True.")
+        return self
+
+
+# ===========================================================================
+# Triggers
+# ===========================================================================
+
+
+class TriggerConfig(BaseModel):
+    """
+    An event that autonomously invokes the agent without a direct user message.
+
+    Triggers allow the agent to react to external events by injecting a
+    predefined prompt as if the user had sent it.  The client fires a trigger
+    by sending ``{"type": "trigger", "name": "<name>"}`` over WebSocket.
+    """
+
+    name: str = Field(
+        description=(
+            "Unique trigger identifier within the agent.  Used as the ``name`` "
+            "field in the WebSocket trigger event."
+        ),
+    )
+    type: Literal["client_event", "cron", "system"] = Field(
+        description=(
+            "Trigger source type:\n"
+            "  - ``'client_event'``: fired explicitly by the client (UI events, "
+            "button clicks).\n"
+            "  - ``'cron'``: scheduled by the server-side scheduler.\n"
+            "  - ``'system'``: fired by internal infrastructure events "
+            "(webhooks, queue messages)."
+        ),
+    )
+    condition: str = Field(
+        description=(
+            "Human-readable description of when this trigger should fire.  "
+            "Used for documentation and future rule-engine evaluation."
+        ),
+    )
+    action_prompt: str = Field(
+        description=(
+            "Text injected into the conversation as a ``HumanMessage`` when "
+            "the trigger fires.  Should instruct the agent clearly on what "
+            "to do in response."
+        ),
+    )
+
+
+# ===========================================================================
+# Tools
+# ===========================================================================
+
+
+class ToolParam(BaseModel):
+    """Schema definition for a single parameter of a tool."""
+
+    type: Literal["str", "int", "float", "bool"] = Field(
+        description="Python primitive type of this parameter.",
+    )
+    description: str | None = Field(
+        default=None,
+        description=(
+            "Human-readable description shown to the LLM.  Omitting this "
+            "reduces the model's ability to supply correct values."
+        ),
+    )
+    default: Any = Field(
+        default=None,
+        description=(
+            "Default value used when the parameter is optional and the LLM "
+            "omits it.  Only meaningful when ``required = False``."
+        ),
+    )
+    required: bool = Field(
+        default=True,
+        description=(
+            "Whether the LLM must always supply this parameter.  When "
+            "``False`` and ``default`` is set, the parameter is marked "
+            "optional in the generated JSON Schema."
+        ),
+    )
+
+
+class ToolConfig(BaseModel):
+    """
+    A tool the agent can invoke during reasoning.
+
+    **Server tools** (``type = 'server'``): implemented server-side.
+    ``AgentFactory._get_server_tool`` resolves the tool by name.
+
+    **Client tools** (``type = 'client'``): executed client-side over
+    WebSocket.  The server sends ``client_tool_call`` and waits for
+    ``client_tool_result`` up to ``timeout`` seconds.
+    """
+
+    name: str = Field(
+        description=(
+            "Tool identifier — must be unique within the agent.  Used as the "
+            "function name exposed to the LLM in the tools JSON Schema."
+        ),
+    )
+    type: Literal["server", "client"] = Field(
+        description=(
+            "Execution location:\n"
+            "  - ``'server'``: runs in the backend process.\n"
+            "  - ``'client'``: dispatched over WebSocket; the server awaits "
+            "the client's response."
+        ),
+    )
+    description: str | None = Field(
+        default=None,
+        description=(
+            "Explanation shown to the LLM describing what the tool does and "
+            "when to use it.  Critical for correct tool selection — keep it "
+            "concise and action-oriented."
+        ),
+    )
+    params: dict[str, ToolParam] = Field(
+        default_factory=dict,
+        description=(
+            "Named parameters the tool accepts.  Compiled into a Pydantic "
+            "model at runtime so LangChain can generate the correct JSON Schema."
+        ),
+    )
+    timeout: int = Field(
+        default=60,
+        ge=1,
+        description=(
+            "Maximum seconds allowed for this tool to complete.\n"
+            "  - **Client tools**: the server waits up to ``timeout`` seconds "
+            "for a ``client_tool_result`` message over WebSocket.  If none "
+            "arrives, the tool returns an error string and the agent continues.\n"
+            "  - **Server tools**: the tool coroutine is wrapped in "
+            "``asyncio.wait_for(timeout=...)``.  On expiry the coroutine is "
+            "cancelled and the tool returns an error string.\n"
+            "Must be strictly less than ``processing_timeout``."
+        ),
+    )
+    broadcast: BroadcastConfig = Field(
+        default_factory=BroadcastConfig,
+        description=(
+            "Broadcast configuration for client tools. Controls which WebSocket "
+            "connections receive ``client_tool_call`` and how responses are "
+            "collected before the result is returned to the LLM.\n\n"
+            "When ``mode='disabled'`` (default), the call is delivered only to "
+            "the connection that triggered the current agent run.\n\n"
+            "When any other mode is set, the call is published to all connections "
+            "on this ``thread_id`` across all pods via Redis pub/sub, and responses "
+            "are aggregated according to the configured strategy.\n\n"
+            "See ``BroadcastConfig`` and ``BroadcastMode`` for full details."
+        ),
+    )
+
+
+# ===========================================================================
+# Components — peripheral I/O
+# ===========================================================================
 
 
 class TTSConfig(BaseModel):
     """
     Text-to-Speech synthesis parameters for the Piper TTS engine.
 
-    All fields are optional overrides. When omitted, the Piper model's built-in
-    defaults are used. Only relevant if the agent's output is rendered as audio.
+    All fields are optional overrides of the Piper model's built-in defaults.
+    TTS is activated by setting ``voice`` to a valid Piper voice model name.
     """
 
     voice: str | None = Field(
         default=None,
-        description="Piper voice model name from the official Piper model registry."
+        description="Piper voice model name from the official registry.",
     )
     speaker_id: int | None = Field(
         default=None,
-        description="Speaker index for multi-speaker Piper models. Ignored for single-speaker voices.",
-        examples=[0]
+        description="Speaker index for multi-speaker models.  Ignored for single-speaker.",
     )
     length_scale: float | None = Field(
         default=None,
-        description="Speech rate multiplier. < 1.0 speeds up, > 1.0 slows down.",
-        ge=0.1, le=5.0,
-        examples=[1.0, 0.8]
+        description="Speech rate multiplier.  < 1.0 speeds up; > 1.0 slows down.",
     )
     noise_scale: float | None = Field(
         default=None,
-        description="Generator noise level. Higher values increase expressiveness and pitch variation.",
-        ge=0.0,
-        examples=[0.667]
+        description="Generator noise controlling expressiveness and pitch variation.",
     )
     noise_w_scale: float | None = Field(
         default=None,
-        description="Phoneme duration noise. Controls rhythm and pause variability.",
-        ge=0.0,
-        examples=[0.8]
+        description="Phoneme duration noise controlling rhythm and pause variability.",
     )
     normalize_audio: bool | None = Field(
         default=None,
-        description="Scale audio samples to the full amplitude range, preventing clipping.",
-        examples=[True]
+        description="When True, audio samples are scaled to full amplitude range.",
     )
     volume: float | None = Field(
         default=None,
-        description="Output volume multiplier. < 1.0 quieter, > 1.0 louder.",
-        ge=0.0,
-        examples=[1.0, 1.5]
+        description="Output volume multiplier.  < 1.0 quieter; > 1.0 louder.",
     )
 
 
@@ -236,23 +1088,24 @@ class Components(BaseModel):
     """
     Optional peripheral components attached to the agent.
 
-    Components extend the agent's I/O beyond text (e.g. voice output via TTS).
-    Only configure what the agent actually uses — unused components have no runtime cost.
+    Only configure what the agent actually uses — unused components have
+    no runtime cost.
     """
 
     tts: TTSConfig = Field(
         default_factory=TTSConfig,
-        description="Text-to-Speech configuration. Activate by setting 'tts.voice'."
+        description="Text-to-Speech configuration.  Activated by setting ``tts.voice``.",
     )
-    # Future: OCR, ASR
 
 
-def _fn_to_tool_config(fn) -> ToolConfig:
-    """Converts a @tool-decorated client function into a ToolConfig instance."""
-    params = {}
-    for param_name, param_info in fn._tool_params.items():
-        params[param_name] = ToolParam(**param_info)
+# ===========================================================================
+# Internal helper
+# ===========================================================================
 
+
+def _fn_to_tool_config(fn: Any) -> ToolConfig:
+    """Convert a ``@tool``-decorated client function into a ``ToolConfig``."""
+    params = {k: ToolParam(**v) for k, v in fn._tool_params.items()}
     return ToolConfig(
         name=fn._tool_name,
         type="client",
@@ -262,117 +1115,153 @@ def _fn_to_tool_config(fn) -> ToolConfig:
     )
 
 
+# ===========================================================================
+# AgentManifest — root model
+# ===========================================================================
+
+
 class AgentManifest(BaseModel):
     """
     Complete declarative description of an agent and its capabilities.
 
     The manifest is the single source of truth for how an agent behaves.
-    It is submitted once via POST /agent/deploy/{thread_id}, serialised to Redis,
-    and used to compile a LangGraph graph that is cached in memory per replica.
+    It is submitted via ``POST /agent/deploy/{thread_id}``, serialised to
+    Redis, and used by ``AgentFactory`` to compile a LangGraph graph.
 
-    Sub-agents are fully recursive — each sub-agent is itself an AgentManifest
-    and is deployed as an independent entity with its own thread_id and WebSocket endpoint.
-
-    Example (minimal):
-        AgentManifest(
-            id="assistant",
-            system_prompt="You are a helpful assistant. Current time: {time}.",
-        )
-
-    Example (with memory and a client tool):
-        AgentManifest(
-            id="support-bot",
-            system_prompt="You are a support agent. History: {summary}.",
-            concurrency="parallel",
-            memory=MemoryConfig(enabled=True, summarization="async", threshold=8, keep_last=3),
-            tools=[
-                ToolConfig(
-                    name="escalate",
-                    type="client",
-                    description="Escalate the conversation to a human agent.",
-                    params={"reason": ToolParam(type="str", description="Why escalation is needed.")},
-                )
-            ],
-        )
+    Sub-agents are fully recursive — each element of ``sub_agents`` is itself
+    an ``AgentManifest`` deployed independently with
+    ``thread_id = '{parent}_{sub.id}'``.
     """
 
     id: str = Field(
         description=(
-            "Unique agent identifier within a deployment. Used to construct sub-agent thread_ids "
-            "and returned in the deploy response as the name→thread_id mapping key."
-        )
+            "Unique agent identifier within a deployment.  Used to construct "
+            "sub-agent thread IDs and as the key in the deploy response's "
+            "``thread_ids`` mapping."
+        ),
     )
     system_prompt: str = Field(
         description=(
-            "System prompt template injected before every LLM call. "
-            "Supports the following format variables:\n"
-            "  {time}    — current server time (always available).\n"
-            "  {summary} — rolling conversation summary from SummaryStore (requires memory.enabled=True).\n"
-            "Unknown variables cause a fallback with an inline error note rather than a crash."
-        )
+            "System prompt template injected before every LLM call.  Supports "
+            "``{time}``, ``{summary}``, ``{amem}``, ``{rag_<name>}`` "
+            "placeholders.  ``{summary}`` requires ``memory.summarization`` "
+            "set to ``'async'`` or ``'blocking'`` (not just "
+            "``memory.enabled``).  Unknown placeholders produce an inline "
+            "``memory.enabled``).  Unknown placeholders produce an inline "
+            "error note instead of crashing."
+        ),
     )
     concurrency: Literal["sequential", "parallel"] = Field(
         default="sequential",
         description=(
-            "Message processing strategy for this agent:\n"
-            "  - 'sequential' (default): a Redis lock ensures only one message is processed at a time "
-            "per thread_id, across all replicas. Safe for stateful workflows where strict "
-            "message ordering matters.\n"
-            "  - 'parallel': no processing lock. Multiple WebSocket connections can send messages "
-            "simultaneously. Atomicity is enforced at the checkpoint write level via a short "
-            "write-lock (milliseconds) and a read-modify-write merge strategy in the checkpointer. "
-            "Suitable for multi-user or multi-device scenarios sharing one agent identity."
-        )
+            "Message processing strategy:\n"
+            "  - ``'sequential'``: Redis lock serialises all requests for this "
+            "thread across replicas.\n"
+            "  - ``'parallel'``: no router-level lock.  Atomicity is enforced "
+            "by the checkpointer's short write-lock."
+        ),
+    )
+    processing_timeout: int = Field(
+        default=120,
+        ge=10,
+        description=(
+            "Maximum seconds the sequential processing lock is held for a "
+            "single agent run.  Increase for slow client tools or long LLM "
+            "calls.  Must be greater than any tool's ``timeout``."
+        ),
+    )
+    queue_timeout: int = Field(
+        default=60,
+        ge=1,
+        description=(
+            "Maximum seconds a new request waits to acquire the processing "
+            "lock (sequential mode only).  After this, the client receives "
+            "``503 Agent is busy``.  Must be less than ``processing_timeout``."
+        ),
     )
     model: ModelConfig = Field(
         default_factory=ModelConfig,
-        description="LLM sampling parameters for this agent. Falls back to model_manager defaults when unset."
+        description=(
+            "LLM sampling parameters.  Falls back to ``model_manager`` global "
+            "defaults when fields are ``None``."
+        ),
     )
     memory: MemoryConfig = Field(
         default_factory=MemoryConfig,
-        description="Persistent memory and summarization settings."
+        description="Persistent memory, rolling summary, and A-MEM configuration.",
+    )
+    rag: RAGConfig = Field(
+        default_factory=RAGConfig,
+        description="Retrieval-Augmented Generation configuration.  Disabled by default.",
+    )
+    cache: CacheConfig = Field(
+        default_factory=CacheConfig,
+        description="Node-level and prompt-level caching configuration.",
+    )
+    tool_retriever: ToolRetrieverConfig = Field(
+        default_factory=ToolRetrieverConfig,
+        description=(
+            "Dynamic tool selection via semantic retrieval.  Disabled by "
+            "default — all tools are sent on every call."
+        ),
+    )
+    inherit_tools_from: list[str] = Field(
+        default_factory=list,
+        description=(
+            "List of agent IDs whose tools this agent should inherit.  "
+            "Resolved recursively: if agent A lists B, and B lists C, then A "
+            "receives tools from both B and C.  On name conflicts, this "
+            "agent's own tools take priority, then earlier IDs in the list "
+            "win over later ones.  Circular references are detected and "
+            "skipped with a warning."
+        ),
     )
     sub_agents: list[AgentManifest] = Field(
         default_factory=list,
         description=(
-            "Nested agents that this agent can delegate to. Each sub-agent is deployed independently "
-            "with thread_id = '{parent_thread_id}_{sub_agent.id}' and gets its own WebSocket endpoint. "
-            "Sub-agents are compiled and registered in Redis before the parent agent."
-        )
+            "Nested agents grouped under this agent for organisational clarity "
+            "and tool inheritance.  Sub-agents are deployed independently with "
+            "``thread_id = '{parent_thread_id}_{sub.id}'`` and are addressable "
+            "by that ID.  The parent agent does NOT delegate to sub-agents "
+            "automatically — delegation is an explicit, opt-in pattern: register "
+            "a dedicated server tool such as ``send_task_to_{sub.id}`` that "
+            "invokes the sub-agent's thread over HTTP/WebSocket and returns its "
+            "response.  Grouping agents here is primarily useful for "
+            "``inherit_tools_from`` resolution and for deployment bookkeeping "
+            "(the deploy endpoint returns all ``thread_ids`` in one response)."
+        ),
     )
     tools: list[ToolConfig] = Field(
         default_factory=list,
         description=(
-            "Tools available to this agent during reasoning. Accepts either ToolConfig instances "
-            "or @tool-decorated callables (automatically converted via _fn_to_tool_config). "
-            "Server tools are resolved by AgentFactory; client tools are dispatched over WebSocket."
-        )
+            "Tools available to this agent.  Accepts ``ToolConfig`` instances, "
+            "``@tool``-decorated callables (auto-converted), or raw dicts."
+        ),
     )
     triggers: list[TriggerConfig] = Field(
         default_factory=list,
         description=(
-            "Events that can autonomously activate this agent without a user message. "
-            "Fired by sending {type: 'trigger', name: '<trigger.name>'} over WebSocket."
-        )
+            "Events that autonomously activate this agent.  Fired by sending "
+            "``{'type': 'trigger', 'name': '<name>'}`` over WebSocket."
+        ),
     )
     components: Components = Field(
         default_factory=Components,
-        description="Optional peripheral components (TTS, and future: OCR, ASR)."
+        description="Optional peripheral components (TTS; future: OCR, ASR).",
     )
 
     @model_validator(mode="before")
     @classmethod
     def convert_tool_functions(cls, data: Any) -> Any:
-        """Normalises the tools list: converts @tool callables and raw dicts to ToolConfig instances."""
+        """Normalise the ``tools`` list: convert callables and dicts to ``ToolConfig``."""
         if isinstance(data, dict):
-            raw_tools = data.get("tools", [])
+            raw = data.get("tools", [])
         elif hasattr(data, "tools"):
-            raw_tools = data.tools
+            raw = data.tools
         else:
             return data
-
         converted = []
-        for t in raw_tools:
+        for t in raw:
             if hasattr(t, "_is_client_tool"):
                 converted.append(_fn_to_tool_config(t))
             elif isinstance(t, dict):
@@ -381,10 +1270,25 @@ class AgentManifest(BaseModel):
                 converted.append(t)
             else:
                 converted.append(t)
-
         if isinstance(data, dict):
             data["tools"] = converted
         return data
+
+    @model_validator(mode="after")
+    def validate_timeouts_and_tools(self):
+        """Validate timeout ordering and tool constraints."""
+        if self.queue_timeout >= self.processing_timeout:
+            raise ValueError(
+                f"queue_timeout ({self.queue_timeout}s) must be strictly less "
+                f"than processing_timeout ({self.processing_timeout}s)."
+            )
+        for t in self.tools:
+            if t.type == "client" and t.timeout >= self.processing_timeout:
+                raise ValueError(
+                    f"Tool '{t.name}' timeout ({t.timeout}s) must be strictly "
+                    f"less than processing_timeout ({self.processing_timeout}s)."
+                )
+        return self
 
 
 AgentManifest.model_rebuild()

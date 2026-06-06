@@ -1,7 +1,6 @@
 import inspect
 from typing import Callable, Dict, Any, get_type_hints
 
-
 # Глобальный реестр клиентских тулов
 _REGISTERED_CLIENT_TOOLS: Dict[str, Callable] = {}
 

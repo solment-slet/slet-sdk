@@ -13,18 +13,15 @@ from typing import (
     AsyncIterable,
     Awaitable,
     Callable,
-    Dict,
-    List,
-    Optional,
-    Union,
 )
 
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 from slet_sdk.aelite.tools import get_registered_tools
-from slet_sdk.core.exceptions import SletClientError
-from slet_sdk.core.schemas import ErrorResponse, ErrorCode
-from slet_sdk.core.schemas.errors import CallbackError, NetworkError
+from slet_sdk.exceptions import SletClientError
+from slet_sdk.schemas import ErrorResponse, ErrorCode
+from slet_sdk.schemas.errors import CallbackError, NetworkError
+from slet_sdk.aelite.typing import StreamMode
 
 if TYPE_CHECKING:
     from slet_sdk.aelite.manifest import AgentManifest
@@ -35,25 +32,29 @@ if TYPE_CHECKING:
 # Внутренние маркеры для очередей
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class _End:
     """Сигнал завершения потока данных в очереди."""
+
     pass
 
 
 @dataclass
 class _Error:
     """Сигнал ошибки в очереди."""
+
     error: ErrorResponse
 
 
 # Тип элемента очереди: либо текстовый чанк, либо служебный маркер.
-_QueueItem = Union[str, _End, _Error]
+_QueueItem = str | _End | _Error
 
 
 # ---------------------------------------------------------------------------
 # Основной класс
 # ---------------------------------------------------------------------------
+
 
 class AgentSession:
     """
@@ -65,7 +66,7 @@ class AgentSession:
     2. Вызовите ``await session.connect()`` — соединение устанавливается,
        фоновый listener запускается автоматически.
     3. Используйте ``chat()`` / ``stream()`` для диалога.
-    4. Зарегистрируйте колбэки (``on_message``, ``on_error`` и др.)
+    4. Зарегистрируйте коллбэки (``on_message``, ``on_error`` и др.)
        для получения незапрошенных сообщений и уведомлений.
     5. Завершите работу через ``await session.disconnect()``.
 
@@ -84,10 +85,10 @@ class AgentSession:
         # Main
         thread_id: str,
         headers: dict,
+        device: str | None = None,
+        stream_mode: StreamMode | str = StreamMode.tokens,
         manifest: AgentManifest | None = None,
         resource: AeliteResource | None = None,
-        # Reconnect
-
     ) -> None:
         self.thread_id = thread_id
         self.manifest = manifest
@@ -99,9 +100,11 @@ class AgentSession:
         # URL-адреса
         ws_base = self._resource.base_ws_url
         base_url = self._resource.base_url
+        self.device = device
+        self.stream_mode = stream_mode
         self.http_url = base_url
         self.ws_url = ws_base
-        self._ws_connect_url = f"{self.ws_url}/agent/ws/{self.thread_id}"
+        self._ws_connect_url = f"{self.ws_url}/agent/ws/{self.thread_id}?device={self.device}?stream_mode={self.stream_mode}"
 
         self.headers = headers
         self.websocket = None
@@ -118,11 +121,37 @@ class AgentSession:
         # --- Коллбэки ---
         self._add_callbacks_attributes()
 
+        # --- Реестр клиентских инструментов ---
+        self._registered_tools: dict[str, Callable] = {}
+
+        # --- Внутренние механизмы ---
+
+        self._listener_task: asyncio.Task | None = None
+
+        # Очередь ответа на активный chat/stream запрос пользователя.
+        self._response_queue: asyncio.Queue[_QueueItem] = asyncio.Queue()
+
+        # Очередь стриминга незапрошенных сообщений (создаётся при необходимости).
+        self._unsolicited_stream_queue: asyncio.Queue[_QueueItem] | None = None
+
+        # Буфер текста незапрошенного сообщения (stream_unsolicited=False).
+        self._unsolicited_buffer: list[str] = []
+
+        # True, пока мы ожидаем ответ на явный запрос пользователя.
+        self._waiting_for_response: bool = False
+
+        # True, пока агент передаёт какие-либо данные (блокирует отправку новых запросов).
+        self._is_incoming_traffic: bool = False
+
         # --- Настройки реконнекта ---
-        self.max_reconnect_attempts: int = 10 # float("inf") для бесконечного реконнекта
-        self.reconnect_delay: int = 5       # секунд между попытками
-        self._reconnect_attempt: int = 0     # текущий номер попытки (только для логов)
-        self._manual_disconnect: bool = False  # True = закрыто намеренно, реконнект не нужен
+        self.max_reconnect_attempts: int = (
+            10  # float("inf") для бесконечного реконнекта
+        )
+        self.reconnect_delay: int = 5  # секунд между попытками
+        self._reconnect_attempt: int = 0  # текущий номер попытки (только для логов)
+        self._manual_disconnect: bool = (
+            False  # True = закрыто намеренно, реконнект не нужен
+        )
 
         # Event сброшен (clear) на время реконнекта; chat/stream ждут его.
         self._reconnect_event: asyncio.Event = asyncio.Event()
@@ -145,26 +174,27 @@ class AgentSession:
             Если сервер вернул ошибочный HTTP-статус при handshake.
         """
         try:
-            self.websocket = await self._resource.websockets.connect(
-                self._ws_connect_url,
-                ping_interval=20,
-                ping_timeout=20,
-                close_timeout=10,
-                additional_headers=self.headers,
-            )
+            await self._connect_websocket()
             self._is_connected = True
             self._listener_task = asyncio.create_task(self._listen_loop())
             self.logger.info(f"Connected to agent at {self.ws_url}")
 
         except InvalidStatus as e:
             self.logger.error(f"Failed to connect to agent: {e}")
-            err = ErrorResponse(
-                status=e.response.status_code,
-                error=ErrorCode.WEBSOCKET_ERROR,
-                message=str(e),
+            err = SletClientError(
+                ErrorResponse(
+                    status=e.response.status_code,
+                    error=ErrorCode.WEBSOCKET_ERROR,
+                    message=str(e),
+                )
             )
             self._invoke_callback(self.on_error, err)
-            raise SletClientError(err)
+            raise err from e
+
+        except Exception as e:
+            self.logger.error(f"Unexpected connect error: {e}")
+            self._invoke_callback(self.on_error, e)
+            raise
 
     async def disconnect(self) -> None:
         """
@@ -221,7 +251,7 @@ class AgentSession:
     # Регистрация инструментов
     # ------------------------------------------------------------------
 
-    def register_tools(self, tools: List[Callable]) -> None:
+    def register_tools(self, tools: list[Callable]) -> None:
         """
         Регистрирует функции клиентских инструментов.
 
@@ -265,9 +295,7 @@ class AgentSession:
         await self._reconnect_event.wait()
 
         if not self._is_connected:
-            raise SletClientError(
-                NetworkError(message="WebSocket is not connected.")
-            )
+            raise SletClientError(NetworkError(message="WebSocket is not connected."))
 
         await self.websocket.send(message)
 
@@ -278,7 +306,7 @@ class AgentSession:
     async def stream(
         self,
         message: str,
-        files: Optional[list[Any]] = None,
+        files: list[Any] | None = None,
     ) -> AsyncGenerator[str, None]:
         """
         Отправляет сообщение агенту и возвращает асинхронный генератор чанков ответа.
@@ -312,11 +340,13 @@ class AgentSession:
                 res = await self.upload_file(f)
                 attachments.append({"ref": f"upload:{res['file_id']}"})
 
-            message = json.dumps({
-                "type": "message",
-                "text": message,
-                "attachments": attachments,
-            })
+            message = json.dumps(
+                {
+                    "type": "message",
+                    "text": message,
+                    "attachments": attachments,
+                }
+            )
 
         # Ожидаем завершения реконнекта (если идёт)
         await self._reconnect_event.wait()
@@ -356,7 +386,7 @@ class AgentSession:
     async def chat(
         self,
         message: str,
-        files: Optional[list[Any]] = None,
+        files: list[Any] | None = None,
     ) -> str:
         """
         Отправляет сообщение и возвращает полный текстовый ответ агента.
@@ -437,7 +467,7 @@ class AgentSession:
             data={"mime_type": mime_type},
         )
 
-    async def trigger(self, name: str, payload: Optional[Dict[str, Any]] = None) -> None:
+    async def trigger(self, name: str, payload: dict[str, Any] | None = None) -> None:
         """
         Отправляет триггер (событие) агенту без ожидания ответа.
 
@@ -466,52 +496,46 @@ class AgentSession:
     # Вспомогательные приватные методы
     # ------------------------------------------------------------------
 
-    async def _add_callbacks_attributes(self) -> None:
+    async def _connect_websocket(self) -> None:
+        self.websocket = await self._resource.websockets.connect(
+            self._ws_connect_url,
+            ping_interval=20,
+            ping_timeout=20,
+            close_timeout=10,
+            additional_headers=self.headers,
+        )
+
+    def _add_callbacks_attributes(self) -> None:
         """
-        Добавляет атрибуты для коллбэков. Коллбэки поддерживают как асинхронные, так и синхронные методы.
+        Добавляет атрибуты для коллбэков.
+        Коллбэки поддерживают как async, так и sync функции.
         """
 
-        # Вызывается при получении полного незапрошенного сообщения (stream_unsolicited=False).
-        self.on_message: Optional[Callable[[str], Union[None, Awaitable[None]]]] = None
+        # Вызывается при получении полного незапрошенного сообщения.
+        # (stream_unsolicited=False)
+        self.on_message: (Callable[[str], None | Awaitable[None]]) | None = None
 
-        # Вызывается при начале незапрошенного потока (stream_unsolicited=True).
-        # Получает AsyncIterable[str] — итератор чанков.
-        self.on_incoming_stream: Optional[
-            Callable[[AsyncIterable[str]], Union[None, Awaitable[None]]]
-        ] = None
+        # Вызывается при начале незапрошенного потока.
+        # (stream_unsolicited=True)
+        self.on_incoming_stream: (
+            Callable[[AsyncIterable[str]], None | Awaitable[None]]
+        ) | None = None
 
         # Уведомление о старте инструмента на стороне сервера.
-        self.on_tool_start: Optional[Callable[[str], Union[None, Awaitable[None]]]] = None
+        self.on_tool_start: (Callable[[str], None | Awaitable[None]]) | None = None
 
-        # Глобальный обработчик ошибок фонового listener-а.
-        self.on_error: Optional[Callable[[ErrorResponse], Union[None, Awaitable[None]]]] = None
+        # Глобальный обработчик исключений.
+        self.on_error: (Callable[[Exception], None | Awaitable[None]]) | None = None
 
-        # Уведомление о смене LLM-модели / провайдера на сервере.
-        self.on_model_change: Optional[
-            Callable[[str, str], Union[None, Awaitable[None]]]
-        ] = None
+        # Глобальный обработчик сообщений об ошибках от сервера.
+        self.on_server_error: (
+            Callable[[ErrorResponse], None | Awaitable[None]]
+        ) | None = None
 
-        # --- Реестр клиентских инструментов ---
-        self._registered_tools: Dict[str, Callable] = {}
-
-        # --- Внутренние механизмы ---
-
-        self._listener_task: Optional[asyncio.Task] = None
-
-        # Очередь ответа на активный chat/stream запрос пользователя.
-        self._response_queue: asyncio.Queue[_QueueItem] = asyncio.Queue()
-
-        # Очередь стриминга незапрошенных сообщений (создаётся при необходимости).
-        self._unsolicited_stream_queue: Optional[asyncio.Queue[_QueueItem]] = None
-
-        # Буфер текста незапрошенного сообщения (stream_unsolicited=False).
-        self._unsolicited_buffer: List[str] = []
-
-        # True, пока мы ожидаем ответ на явный запрос пользователя.
-        self._waiting_for_response: bool = False
-
-        # True, пока агент передаёт какие-либо данные (блокирует отправку новых запросов).
-        self._is_incoming_traffic: bool = False
+        # Уведомление о смене модели / провайдера.
+        self.on_model_change: (Callable[[str, str], None | Awaitable[None]]) | None = (
+            None
+        )
 
     async def _cancel_listener(self) -> None:
         """
@@ -539,7 +563,7 @@ class AgentSession:
 
     def _cleanup_queues(self) -> None:
         """
-        Разблокирует всех ожидающих при разрыве соединения и очищает буферы.
+        Разблокирует всех ожидающих при разрыве соединения и очищает буфера.
 
         Должна вызываться из ``_listen_loop`` перед попыткой реконнекта.
         """
@@ -668,7 +692,7 @@ class AgentSession:
         elif event_type == "error":
             self._is_incoming_traffic = False
 
-            # Закрываем незавершённые стримы/буферы
+            # Закрываем незавершённые стримы/буфера
             if self._unsolicited_stream_queue:
                 await self._unsolicited_stream_queue.put(_End())
                 self._unsolicited_stream_queue = None
@@ -679,7 +703,7 @@ class AgentSession:
             if self._waiting_for_response:
                 await self._response_queue.put(_Error(err))
 
-            self._invoke_callback(self.on_error, err)
+            self._invoke_callback(self.on_server_error, err)
 
     async def _handle_unsolicited_token(self, token: str) -> None:
         """
@@ -718,7 +742,7 @@ class AgentSession:
 
         if not self._manual_disconnect:
             if self.on_error:
-                self._invoke_callback(self.on_error, error)
+                self._invoke_callback(self.on_error, SletClientError(error))
             # Запускаем реконнект как отдельную задачу.
             # Используем add_done_callback, чтобы не потерять исключение молча.
             task = asyncio.create_task(self._reconnect_loop())
@@ -739,7 +763,7 @@ class AgentSession:
     # Вспомогательные методы
     # ------------------------------------------------------------------
 
-    def _invoke_callback(self, callback: Optional[Callable], *args: Any) -> None:
+    def _invoke_callback(self, callback: Callable | None, *args: Any) -> None:
         """
         Безопасно вызывает колбэк в текущем event loop.
 
@@ -777,7 +801,9 @@ class AgentSession:
             # Избегаем рекурсии: не вызываем on_error из самого on_error
             if self.on_error is not None and callback is not self.on_error:
                 try:
-                    cb_error = CallbackError(message=str(e))
+                    cb_error = SletClientError(
+                        CallbackError(message=str(e)),
+                    )
                     if inspect.iscoroutinefunction(self.on_error):
                         asyncio.create_task(self.on_error(cb_error))
                     else:
@@ -844,13 +870,12 @@ class AgentSession:
                 if inspect.iscoroutinefunction(fn):
                     result = str(await fn(**args))
                 else:
-                    # Синхронные инструменты запускаем в executor,
-                    # чтобы не блокировать event loop
                     loop = asyncio.get_running_loop()
                     result = str(await loop.run_in_executor(None, lambda: fn(**args)))
             except Exception as e:
                 result = f"Error executing tool '{tool_name}': {e}"
                 self.logger.error(result)
+                self._invoke_callback(self.on_error, e)
 
         response = {
             "type": "client_tool_result",
@@ -894,13 +919,7 @@ class AgentSession:
             )
 
             try:
-                self.websocket = await self._resource.websockets.connect(
-                    self._ws_connect_url,
-                    ping_interval=20,
-                    ping_timeout=20,
-                    close_timeout=10,
-                    additional_headers=self.headers,
-                )
+                await self._connect_websocket()
 
                 self._is_connected = True
                 self._manual_disconnect = False
@@ -927,7 +946,7 @@ class AgentSession:
 
                 error = NetworkError(message=f"{message}: {e}")
                 if self.on_error:
-                    self._invoke_callback(self.on_error, error)
+                    self._invoke_callback(self.on_error, SletClientError(error))
 
                 if is_last:
                     # Разблокируем ожидающих, чтобы они не зависли навсегда

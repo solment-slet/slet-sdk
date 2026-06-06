@@ -1,5 +1,5 @@
 from enum import Enum
-from slet_sdk.core.schemas import ErrorResponse
+from slet_sdk.schemas import ErrorResponse
 
 
 class SletClientError(Exception):
@@ -19,7 +19,7 @@ class SletClientError(Exception):
     def to_dict(self, stringify_error: bool = False) -> dict:
         if (
             stringify_error
-        ):  # Чтобы добавить extra, trace_id только если он есть, и преобразовать error в строку (т.к. как он может быть enum)
+        ):  # Чтобы добавить extra, trace_id только если он есть и преобразовать error в строку (т.к. как он может быть enum)
             if isinstance(self.error, Enum):
                 error = self.error.value
             else:

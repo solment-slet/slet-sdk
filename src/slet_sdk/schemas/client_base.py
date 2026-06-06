@@ -7,6 +7,7 @@ class SuccessResponse(BaseModel):
     """
     Базовая модель для успешных ответов. (не обязательно используется во всех ручках)
     """
+
     status: int = 200
     message: str = "Success"
 
@@ -15,6 +16,7 @@ class ErrorResponse(BaseModel):
     """
     Базовая модель для ошибок. (не обязательно используется во всех ручках)
     """
+
     status: int
     error: str
     message: str

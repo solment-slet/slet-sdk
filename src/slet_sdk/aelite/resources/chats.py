@@ -1,7 +1,7 @@
 from uuid import UUID
 
 from slet_sdk.core.mixins import BaseResource
-from slet_sdk.core.schemas import SuccessResponse
+from slet_sdk.schemas import SuccessResponse
 from slet_sdk.aelite.schemas.chats import (
     GetUserChatsResponse,
     ChatWithoutHistory,

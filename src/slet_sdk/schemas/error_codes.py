@@ -5,6 +5,7 @@ class ErrorCode(StrEnum):
     """
     Каталог кодов ошибок (не HTTP кодов)
     """
+
     UNKNOWN_ERROR = "unknown_error"
 
     # 4xx

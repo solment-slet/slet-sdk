@@ -1,5 +1,6 @@
 from pydantic import Field
-from slet_sdk.core.schemas.client_base import SuccessResponse
+from slet_sdk.schemas import SuccessResponse
+
 
 class AgentDeployResponse(SuccessResponse):
     status: int = 201

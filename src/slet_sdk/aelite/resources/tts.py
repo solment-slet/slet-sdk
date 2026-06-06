@@ -61,7 +61,9 @@ class TTSResource(BaseResource):
             async def _sender_loop():
                 try:
                     if smart_buffering:
-                        await self._smart_buffer_sender(text_iterator, ws, smart_buffer_max_chunk_size)
+                        await self._smart_buffer_sender(
+                            text_iterator, ws, smart_buffer_max_chunk_size
+                        )
                     else:
                         await self._passthrough_sender(text_iterator, ws)
                 except Exception as e:
@@ -95,7 +97,9 @@ class TTSResource(BaseResource):
                                 break
 
                             if event.get("event") == "error":
-                                self.logger.error(f"TTS Server Error: {event.get('message')}")
+                                self.logger.error(
+                                    f"TTS Server Error: {event.get('message')}"
+                                )
                                 # Можно рейзить ошибку или просто прерывать
                                 break
 
@@ -127,7 +131,7 @@ class TTSResource(BaseResource):
         # Регулярка для поиска конца предложения: точка, вопрос, восклицание или перевод строки,
         # за которыми следует пробел или конец строки.
         # Группируем разделитель, чтобы оставить его в отправляемом куске.
-        split_pattern = re.compile(r'([.?!]+(?:\s|$)|[\n]+)')
+        split_pattern = re.compile(r"([.?!]+(?:\s|$)|[\n]+)")
 
         async for chunk in text_iter:
             buffer += chunk
@@ -148,7 +152,7 @@ class TTSResource(BaseResource):
 
                 elif len(buffer) > max_buffer_size:
                     # Буфер переполнен, а точки нет. Ищем хотя бы пробел, чтобы не резать слово.
-                    last_space = buffer.rfind(' ')
+                    last_space = buffer.rfind(" ")
                     if last_space != -1:
                         part = buffer[:last_space]
                         buffer = buffer[last_space:]  # Пробел и остаток оставляем

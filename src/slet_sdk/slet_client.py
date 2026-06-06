@@ -1,4 +1,4 @@
-from  __future__ import annotations
+from __future__ import annotations
 import httpx
 import json
 import logging
@@ -11,10 +11,10 @@ from typing import (
 from pydantic import BaseModel, ValidationError
 import websockets
 
-from slet_sdk.core.schemas import ErrorCode, ErrorResponse
-from slet_sdk.core.exceptions import SletClientError
-from slet_sdk.core.schemas.errors import NetworkError
-from slet_sdk.core.schemas.auth import (
+from slet_sdk.schemas import ErrorCode, ErrorResponse
+from slet_sdk.exceptions import SletClientError
+from slet_sdk.schemas.errors import NetworkError
+from slet_sdk.schemas.auth import (
     UserLoginResponse,
     UserRegisterResponse,
     UserRefreshResponse,
@@ -54,11 +54,15 @@ class SletClient:
         self.base_ws_url = self.base_url.replace("http://", "ws://").replace(
             "https://", "wss://"
         )
-        self._client = client if client else httpx.AsyncClient(
-            base_url=base_url,
-            timeout=httpx.Timeout(timeout if timeout else 500.0),
-            verify=ssl_verify,
-            transport=transport,
+        self._client = (
+            client
+            if client
+            else httpx.AsyncClient(
+                base_url=base_url,
+                timeout=httpx.Timeout(timeout if timeout else 500.0),
+                verify=ssl_verify,
+                transport=transport,
+            )
         )
         self.websockets = websockets_module
         self.api_versions = api_versions
@@ -98,8 +102,7 @@ class SletClient:
         url: str,
         schema: type[T],
         **kwargs: Any,
-    ) -> T:
-        ...
+    ) -> T: ...
 
     @overload
     async def request(
@@ -108,8 +111,7 @@ class SletClient:
         url: str,
         schema: None = None,
         **kwargs: Any,
-    ) -> dict:
-        ...
+    ) -> dict: ...
 
     async def request[T: BaseModel](
         self,
@@ -146,7 +148,11 @@ class SletClient:
 
             if 200 <= resp.status_code < 300:
                 data = self._parse_json(resp)
-                return self._validate_schema(data, schema, resp.status_code) if schema else data
+                return (
+                    self._validate_schema(data, schema, resp.status_code)
+                    if schema
+                    else data
+                )
 
             if (
                 resp.status_code == 401
@@ -180,10 +186,7 @@ class SletClient:
             )
 
     def _validate_schema[T: BaseModel](
-        self,
-        data: dict,
-        schema: Type[T],
-        status: int
+        self, data: dict, schema: Type[T], status: int
     ) -> T:
         try:
             return schema.model_validate(data)
@@ -228,7 +231,9 @@ class SletClient:
             )
         return data
 
-    async def signup(self, name: str, email: str, password: str) -> UserRegisterResponse:
+    async def signup(
+        self, name: str, email: str, password: str
+    ) -> UserRegisterResponse:
         data = await self.request(
             "POST",
             self.api_versions.identify + "/signup",
@@ -247,7 +252,9 @@ class SletClient:
             )
         return data
 
-    async def refresh_tokens(self, refresh_token: str | None = None) -> UserRefreshResponse:
+    async def refresh_tokens(
+        self, refresh_token: str | None = None
+    ) -> UserRefreshResponse:
         token = self.refresh_token if refresh_token is None else refresh_token
         data = await self._request_impl(
             "POST",

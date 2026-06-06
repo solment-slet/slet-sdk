@@ -1,4 +1,10 @@
-from typing import Protocol, Any, AsyncContextManager, Literal
+from collections.abc import Mapping, Iterable
+from typing import (
+    Protocol,
+    Any,
+    AsyncContextManager,
+    Literal,
+)
 
 
 class LoggerLike(Protocol):
@@ -14,13 +20,18 @@ class WebSocketClient(Protocol):
     async def send(self, data: Any) -> None: ...
     async def recv(self) -> Any: ...
 
+
 class WebsocketsModule(Protocol):
     async def connect(
         self,
         uri: str,
+        *,
+        ping_interval: float | None = None,
+        ping_timeout: float | None = None,
+        close_timeout: float | None = None,
+        additional_headers: Mapping[str, str] | Iterable[tuple[str, str]] | None = None,
         **kwargs: Any,
-    ) -> AsyncContextManager[WebSocketClient]:
-        ...
+    ) -> AsyncContextManager[WebSocketClient]: ...
 
 
-UserPrivilege = Literal["user", "admin"]
+UserPrivilege = Literal["user", "dev", "admin"]

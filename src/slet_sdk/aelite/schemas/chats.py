@@ -1,18 +1,17 @@
 from datetime import datetime
-from typing import List, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, Field, ConfigDict
-
 
 # ---
 # RESPONSES & INTERNAL USE
 # ---
 
+
 class ChatWithoutHistory(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
-    id: UUID # обычно UUIDv7
+    id: UUID  # обычно UUIDv7
     title: str
     created_at: datetime = Field(description="ISO 8601, RFC 3339")
 
@@ -30,20 +29,21 @@ class MessageSchema(BaseModel):
     created_at: datetime
 
     # Для AI сообщений (если были вызовы инструментов)
-    tool_calls: List[ToolCallSchema] = []
+    tool_calls: list[ToolCallSchema] = []
 
     # Для Tool сообщений (информация о результате)
-    tool_call_id: Optional[str] = None
-    tool_name: Optional[str] = None
+    tool_call_id: str | None = None
+    tool_name: str | None = None
 
 
 class ChatWithHistory(ChatWithoutHistory):
-    messages: List[MessageSchema]
+    messages: list[MessageSchema]
 
 
 # ---
 # REQUESTS
 # ---
+
 
 class ChatCreateAndRename(BaseModel):
     title: str | None = Field(default=None, max_length=128)
@@ -60,6 +60,7 @@ class ChatRename(ChatCreateAndRename):
 # ---
 # RESPONSES
 # ---
+
 
 class GetUserChatsResponse(BaseModel):
     chats: list[ChatWithoutHistory]

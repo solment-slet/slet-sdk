@@ -38,9 +38,9 @@ manifest = AgentManifest(
                     id="Krosh",
                     system_prompt="Ты персонаж из мультфильма Смешарики по имени Крош.",
                 )
-            ]
+            ],
         )
-    ]
+    ],
 )
 
 
@@ -57,14 +57,15 @@ async def main():
 
         # Подписка на события
         agent.on_message = lambda msg: print(f"Пришло сообщение!: {msg}")
+        agent.on_tool_start = lambda tool_name: print(
+            f"Вызван сервеный инструмент: {tool_name}"
+        )
         agent.on_error = lambda err: print(f"Ошибка! {str(err)}")
 
         # Основной цикл
         while True:
             # Сбрасываем буфер перед чтением
-            await asyncio.get_event_loop().run_in_executor(
-                None, sys.stdin.flush
-            )
+            await asyncio.get_event_loop().run_in_executor(None, sys.stdin.flush)
             user_input = await ainput("YOU: ")
             files: list = []
             while True:
@@ -80,8 +81,7 @@ async def main():
                 finally:
                     if file_obj:
                         pass
-                        #file_obj.close()
-
+                        # file_obj.close()
 
             if user_input == "exit":
                 break
