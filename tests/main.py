@@ -2,7 +2,7 @@ import asyncio
 import sys
 from aioconsole import ainput
 from slet_sdk import SletClient
-from slet_sdk.aelite.manifest import AgentManifest, ToolConfig, MemoryConfig
+from slet_sdk.aelite.manifest import AgentManifest, ToolConfig, MemoryConfig, BroadcastConfig
 from slet_sdk.aelite.tools import tool
 
 
@@ -12,7 +12,7 @@ async def get_clipboard() -> str:
     return await ainput("Clipboard: ")
 
 
-@tool(broadcast=True)
+@tool(broadcast=BroadcastConfig())
 async def show_notification(title: str, message: str) -> None:
     """Показывает уведомление на рабочем столе пользователя"""
     print(f"\n🔔 [{title}] {message}")
@@ -21,7 +21,7 @@ async def show_notification(title: str, message: str) -> None:
 manifest = AgentManifest(
     id="MainAgent",
     system_prompt="""Ты полезный ассистент по имени Aelite, 
-ты можешь использовать своих подагентов для помощи пользователю""",
+ты можешь использовать своих подагентов для помощи пользователю. Перед тем как использовать любой инструмент добавляй текст для пользователя о том что его используешь.""",
     concurrency="parallel",
     memory=MemoryConfig(enabled=True, summarization="async"),
     tools=[

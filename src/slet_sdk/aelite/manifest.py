@@ -41,7 +41,7 @@ Unknown placeholders produce an inline error note instead of crashing.
 from __future__ import annotations
 
 from typing import Any, Literal
-from enum import Enum
+from enum import StrEnum
 
 from pydantic import BaseModel, Field, model_validator, field_validator
 
@@ -50,7 +50,7 @@ from pydantic import BaseModel, Field, model_validator, field_validator
 # ===========================================================================
 
 
-class BroadcastMode(str, Enum):
+class BroadcastMode(StrEnum):
     """
     Determines how the server collects responses from connected WebSocket
     clients when a client tool is invoked in broadcast mode.
@@ -115,7 +115,7 @@ class BroadcastConfig(BaseModel):
     """
 
     mode: BroadcastMode = Field(
-        default=BroadcastMode.disabled,
+        default=BroadcastMode.all,
         description=(
             "Response collection strategy. See ``BroadcastMode`` for full "
             "semantics of each option."

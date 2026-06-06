@@ -22,6 +22,7 @@ from slet_sdk.exceptions import SletClientError
 from slet_sdk.schemas import ErrorResponse, ErrorCode
 from slet_sdk.schemas.errors import CallbackError, NetworkError
 from slet_sdk.aelite.typing import StreamMode
+from slet_sdk.aelite.utils.device_info import get_device_string
 
 if TYPE_CHECKING:
     from slet_sdk.aelite.manifest import AgentManifest
@@ -85,7 +86,7 @@ class AgentSession:
         # Main
         thread_id: str,
         headers: dict,
-        device: str | None = None,
+        device: str = get_device_string(),
         stream_mode: StreamMode | str = StreamMode.tokens,
         manifest: AgentManifest | None = None,
         resource: AeliteResource | None = None,
@@ -104,12 +105,19 @@ class AgentSession:
         self.stream_mode = stream_mode
         self.http_url = base_url
         self.ws_url = ws_base
-        self._ws_connect_url = f"{self.ws_url}/agent/ws/{self.thread_id}?device={self.device}?stream_mode={self.stream_mode}"
+        self._ws_connect_url = (
+            f"{self.ws_url}/agent/ws/{self.thread_id}"
+            f"?device={self.device}"
+            f"&stream_mode={self.stream_mode}"
+        )
 
         self.headers = headers
         self.websocket = None
         self.logger = self._resource.logger
         self._is_connected = False
+
+        self.logger.debug(f"Device name: {self.device}")
+        self.logger.debug(f"Stream mode: {self.stream_mode}")
 
         # --- Настройки поведения ---
 
@@ -334,8 +342,8 @@ class AgentSession:
             При ошибке соединения или если агент вернул ошибку.
         """
         # Загружаем файлы и оборачиваем сообщение в JSON при наличии вложений
+        attachments: list[dict] = []
         if files:
-            attachments: list[dict] = []
             for f in files:
                 res = await self.upload_file(f)
                 attachments.append({"ref": f"upload:{res['file_id']}"})
@@ -369,7 +377,10 @@ class AgentSession:
             self._waiting_for_response = True
 
             try:
-                await self.send(message)
+                payload = {"type": "message", "text": message}
+                if attachments:
+                    payload["attachments"] = attachments
+                await self.send(json.dumps(payload))
 
                 while True:
                     item = await self._response_queue.get()
@@ -458,8 +469,7 @@ class AgentSession:
                 f"Unsupported file type: {type(file).__name__}. "
                 "Expected str, bytes, or file-like object."
             )
-
-        upload_url = f"{self.http_url}/ae/upload/"
+        upload_url = "/upload/"
         return await self._resource._request(
             "POST",
             upload_url,

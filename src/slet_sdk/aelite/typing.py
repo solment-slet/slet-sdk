@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class StreamMode(str, Enum):
+class StreamMode(StrEnum):
     """
     Режимы стриминга, отправляются при установке WebSocket соединения или внутри соединения.
     """
