@@ -40,10 +40,189 @@ Unknown placeholders produce an inline error note instead of crashing.
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any, Literal, Annotated
 from enum import StrEnum
 
 from pydantic import BaseModel, Field, model_validator, field_validator
+
+
+# ===========================================================================
+# MCP
+# ===========================================================================
+
+
+class MCPResourceMode(StrEnum):
+    """
+    Defines how MCP server resources are exposed to the agent.
+
+    tool
+        Each resource is registered as a pseudo-tool named
+        ``<server_id>_resource_<name>``. The LLM decides when to request
+        the resource. Suitable for optional or expensive resources that
+        are not required on every request.
+
+    tool_with_retriever
+        Same as ``tool``, but additionally registers a retriever tool
+        ``<server_id>_find_resource``. The retriever accepts a text query
+        and returns matching resources. Useful when a server exposes a
+        large number of resources and the LLM needs assistance discovering
+        the relevant ones.
+
+    system_prompt
+        Resource contents are injected into the system prompt via
+        placeholders of the form
+        ``{mcp_res_<server_id>_<resource_name>}``.
+        The LLM always sees the resource content. Intended for
+        reasonably sized textual resources.
+
+    message
+        Resource contents are injected into the current user message
+        through the same placeholders. Useful for turn-specific context.
+    """
+
+    tool = "tool"
+    tool_with_retriever = "tool_with_retriever"
+    system_prompt = "system_prompt"
+    message = "message"
+
+
+class MCPTransportSSE(BaseModel):
+    type: Literal["sse"] = "sse"
+    url: str | None = Field(
+        default=None,
+        description=(
+            "Base URL of the remote MCP server. Required when using "
+            "the SSE transport."
+        ),
+    )
+    headers: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Additional HTTP headers sent with requests "
+            "(for example authentication headers)."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def validate_transport_fields(self):
+        if not self.url:
+            raise ValueError("url is required")
+        return self
+
+
+class MCPTransportStdio(BaseModel):
+    type: Literal["stdio"] = "stdio"
+    command: str | None = Field(
+        default=None,
+        description=(
+            "Command used to launch the local stdio process on the client. "
+            "Stored only for documentation and manifest validation. "
+            "The server identifies the MCP server exclusively by ``id``."
+        ),
+    )
+    args: list[str] = Field(
+        default_factory=list,
+        description="Arguments passed to ``command``.",
+    )
+    env: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Environment variables supplied to the process. "
+            "Included for documentation purposes only."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def validate_transport_fields(self):
+        if not self.command:
+            raise ValueError("command is required")
+        return self
+
+
+class MCPServerConfig(BaseModel):
+    """
+    Configuration of a single MCP server attached to the agent.
+
+    Two transport modes are supported:
+
+    **SSE** (``transport='sse'``)
+        The backend connects directly to the remote MCP server over HTTP.
+        Requires ``url``.
+
+    **stdio** (``transport='stdio'``)
+        The backend sends an ``mcp_call`` event to the client over
+        WebSocket. The client launches a local stdio process and returns
+        the result via ``mcp_result``. The client maintains its own
+        mapping of ``server_id → command``. The backend transmits only
+        ``server_id``, preventing arbitrary command execution on the
+        client side.
+
+        ``command`` is required for documentation and manifest validation
+        but is never transmitted to the client.
+
+    Tools, resources, and prompts provided by the server are integrated
+    into the agent alongside declarative ``tools`` defined in the manifest
+    and participate in ``inherit_tools_from`` resolution.
+    """
+
+    id: str = Field(
+        description=(
+            "Unique server identifier within the agent. Used as a prefix "
+            "for generated tool names (``<id>_<tool_name>``) and resource "
+            "placeholders (``{mcp_res_<id>_<resource_name>}``) to avoid "
+            "name collisions when multiple MCP servers are attached."
+        ),
+    )
+    transport: Annotated[
+        MCPTransportSSE | MCPTransportStdio,
+        Field(discriminator="type")
+    ] = Field(
+        default_factory=MCPTransportSSE,
+        description=(
+            "Transport configuration. SSE connects directly over HTTP, "
+            "while stdio is proxied through the client."
+        ),
+    )
+
+    # Content to load
+    load_tools: bool = Field(
+        default=True,
+        description=(
+            "Load and register tools exposed by the server "
+            "(``tools/list``)."
+        ),
+    )
+    load_resources: bool = Field(
+        default=False,
+        description=(
+            "Load resources exposed by the server "
+            "(``resources/list``)."
+        ),
+    )
+    resource_mode: MCPResourceMode = Field(
+        default=MCPResourceMode.tool,
+        description=(
+            "Controls how resources are exposed to the agent. "
+            "Ignored when ``load_resources=False``. "
+            "See ``MCPResourceMode`` for details."
+        ),
+    )
+    load_prompts: bool = Field(
+        default=False,
+        description=(
+            "Load prompts exposed by the server (``prompts/list``). "
+            "Loaded prompts are available through placeholders of the form "
+            "``{mcp_prompt_<id>_<prompt_name>}`` in the system prompt "
+            "or any message."
+        ),
+    )
+
+    timeout: int = Field(
+        default=30,
+        ge=1,
+        description="Timeout for a single MCP request in seconds.",
+    )
+
 
 # ===========================================================================
 # Broadcast
@@ -181,7 +360,21 @@ class ModelConfig(BaseModel):
     All fields are optional — when omitted, the global defaults configured
     in ``model_manager`` are used.
     """
-
+    base_url: str | None = Field(
+        default=None,
+        min_length=8,
+        max_length=500,
+    )
+    model: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=200,
+    )
+    api_key: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=512,
+    )
     temperature: float | None = Field(
         default=None,
         ge=0.0,
@@ -1236,6 +1429,17 @@ class AgentManifest(BaseModel):
         description=(
             "Tools available to this agent.  Accepts ``ToolConfig`` instances, "
             "``@tool``-decorated callables (auto-converted), or raw dicts."
+        ),
+    )
+    mcp_servers: list[MCPServerConfig] = Field(
+        default_factory=list,
+        description=(
+            "MCP servers attached to the agent. Tools, resources, and prompts "
+            "provided by each server are merged with the manifest's declarative "
+            "``tools``. Tool names are prefixed with ``<server_id>_`` to avoid "
+            "name collisions. All loaded tools participate in "
+            "``inherit_tools_from`` resolution and in the dynamic "
+            "``tool_retriever`` mechanism alongside regular tools."
         ),
     )
     triggers: list[TriggerConfig] = Field(

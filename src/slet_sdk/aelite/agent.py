@@ -502,6 +502,29 @@ class AgentSession:
         event = {"type": "trigger", "name": name, "payload": payload or {}}
         await self.send(json.dumps(event))
 
+    async def set_stream_mode(self, stream_mode: StreamMode) -> None:
+        """
+        Меняет режим стриминга сообщений от агента.
+
+        Не влияет на уже запущенные запросы к агенту,
+        вступает в силу на следующем запросе.
+
+        Parameters
+        ----------
+        stream_mode:
+            Режим стриминга сообщений.
+
+        Raises
+        ------
+        ConnectionError
+            Если WebSocket не подключён.
+        """
+        if not self._is_connected:
+            raise ConnectionError("Not connected.")
+
+        event = {"type": "set_stream_mode", "mode": stream_mode}
+        await self.send(json.dumps(event))
+
     # ------------------------------------------------------------------
     # Вспомогательные приватные методы
     # ------------------------------------------------------------------

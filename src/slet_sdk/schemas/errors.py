@@ -5,6 +5,7 @@ from pydantic import BaseModel, Field
 from slet_sdk.schemas import ErrorCode
 from slet_sdk.schemas.client_base import ErrorResponse
 
+
 # ===========================
 # 401
 # ===========================
@@ -38,6 +39,35 @@ class TokenRefreshError(Unauthorized):
 class InvalidAccessToken(Unauthorized):
     error: str = ErrorCode.INVALID_ACCESS_TOKEN
     message: str = Field(default="Invalid Access Token")
+
+
+class InvalidApiKey(Unauthorized):
+    error: str = ErrorCode.INVALID_API_KEY
+    message: str = Field(default="Invalid API Key")
+
+
+class InactiveApiKey(Unauthorized):
+    error: str = ErrorCode.INACTIVE_API_KEY
+    message: str = Field(default="Inactive or Expired API Key")
+
+
+class MissingCredentials(Unauthorized):
+    error: str = ErrorCode.MISSING_CREDENTIALS
+    message: str = Field(default="Missing Credentials in Headers")
+
+
+# ===========================
+# 403
+# ===========================
+
+
+class Forbidden(ErrorResponse):
+    """
+    Base
+    """
+    status: int = 403
+    error: str = ErrorCode.FORBIDDEN
+    message: str = Field(default="Forbidden")
 
 
 # ===========================
@@ -76,6 +106,31 @@ class Conflict(ErrorResponse):
     )
 
 
+class ApiKeyLimitExceededExtra(BaseModel):
+    limit: int = Field(
+        description="Maximum number of API keys per user",
+        ge=0,
+    )
+    current_count: int = Field(
+        description="The current number of API keys of the user",
+        ge=0,
+    )
+
+
+class ApiKeyLimitExceeded(Conflict):
+    error: str = ErrorCode.API_KEY_LIMIT_EXCEEDED
+    message: str = Field(
+        "The maximum API keys have been reached. "
+        "Delete one of the existing keys to create a new one",
+    )
+    extra: ApiKeyLimitExceededExtra
+
+    def __init__(self, *, limit: int, current_count: int, **kwargs):
+        kwargs.pop("extra", None)
+        kwargs["extra"] = ApiKeyLimitExceededExtra(limit=limit, current_count=current_count)
+        super().__init__(**kwargs)
+
+
 # ===========================
 # 422
 # ===========================
@@ -96,7 +151,7 @@ class UnprocessableEntity(ErrorResponse):
 
 class SchemaValidationErrorExtra(BaseModel):
     field: str = Field(description="Invalid field name", examples=["email"])
-    message: str = Field(
+    detail: str = Field(
         description="Description of the validation error",
         examples=[
             "Field required",
@@ -107,12 +162,12 @@ class SchemaValidationErrorExtra(BaseModel):
 
 class SchemaValidationError(UnprocessableEntity):
     error: str = ErrorCode.VALIDATION_ERROR
-    message: str = Field("Validation Error", examples=["Validation Error"])
+    message: str = Field("Validation Error")
     extra: SchemaValidationErrorExtra
 
-    def __init__(self, *, field: str, message: str, **kwargs):
+    def __init__(self, *, field: str, detail: str, **kwargs):
         kwargs.pop("extra", None)
-        kwargs["extra"] = SchemaValidationErrorExtra(field=field, message=message)
+        kwargs["extra"] = SchemaValidationErrorExtra(field=field, detail=detail)
         super().__init__(**kwargs)
 
 
@@ -155,11 +210,6 @@ class TooManyAttempts(TooManyRequests):
         examples=["Too Many Attempts"],
     )
 
-    def __init__(self, *, retry_after: int = 60, **kwargs):
-        kwargs.pop("extra", None)
-        kwargs["extra"] = TooManyRequestsExtra(retry_after=retry_after)
-        super().__init__(**kwargs)
-
 
 # ===========================
 # 500
@@ -176,6 +226,26 @@ class InternalServerError(ErrorResponse):
     message: str = Field(
         default="Internal Server Error",
         description="Description of the server error",
+    )
+
+
+class BadGateway(ErrorResponse):
+    """
+    Base
+    """
+
+    status: int = 502
+    error: str = ErrorCode.BAD_GATEWAY
+    message: str = Field(
+        default="Bad Gateway",
+    )
+
+
+class ProviderUnavailableError(ErrorResponse):
+    status: int = 502
+    error: str = ErrorCode.PROVIDER_UNAVAILABLE_ERROR
+    message: str = Field(
+        default="Provider Unavailable",
     )
 
 
@@ -198,14 +268,14 @@ class CustomError(ErrorResponse):
 
 class NetworkError(CustomError):
     """
-    Anything other than Network Error
+    Any network errors on the client are used in the SDK.
     """
 
     status: int = 599
     error: str = ErrorCode.NETWORK_ERROR
     message: str = Field(
         default="Network Error",
-        description="Description of the network error, for example timeout",
+        description="Network Error",
     )
 
 

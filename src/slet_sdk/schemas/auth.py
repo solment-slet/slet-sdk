@@ -1,4 +1,5 @@
 import re
+
 from pydantic import BaseModel, EmailStr, ConfigDict, field_validator
 from slet_sdk.schemas import SuccessResponse
 

@@ -8,7 +8,7 @@ from slet_sdk.aelite.schemas.agent import AgentDeployResponse
 from slet_sdk.aelite.typing import StreamMode
 
 # Sub Resources for AeliteResource
-from .chats import ChatsResource
+from .threads import ThreadsResource
 from .tts import TTSResource
 
 
@@ -21,7 +21,7 @@ class AeliteResource(BaseResource):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
 
-        self.chats = ChatsResource(*args, **kwargs)
+        self.threads = ThreadsResource(*args, **kwargs)
         self.tts = TTSResource(*args, **kwargs)
 
     async def deploy(
@@ -34,14 +34,14 @@ class AeliteResource(BaseResource):
         Возвращает thread ID каждого агента и подагента.
 
         :param manifest: Конфигурация агента
-        :param thread_id: ID сессии (чата), если None создается новый
+        :param thread_id: ID треда, если None создается новый
         """
         if not isinstance(manifest, dict):
             manifest = manifest.model_dump()
 
         if not thread_id:
-            chat = await self.chats.new_chat()
-            thread_id = str(chat.id)
+            thread = await self.threads.new_thread()
+            thread_id = str(thread.id)
 
         return await self._request(
             "POST",

@@ -20,8 +20,9 @@ async def show_notification(title: str, message: str) -> None:
 
 manifest = AgentManifest(
     id="MainAgent",
-    system_prompt="""Ты полезный ассистент по имени Aelite, 
-ты можешь использовать своих подагентов для помощи пользователю. Перед тем как использовать любой инструмент добавляй текст для пользователя о том что его используешь.""",
+    system_prompt="""Ты гениальный ассистент по имени Aelite.
+    
+    Перед тем как использовать любой инструмент добавляй текст для пользователя о том что его используешь.""",
     concurrency="parallel",
     memory=MemoryConfig(enabled=True, summarization="async"),
     tools=[
@@ -50,7 +51,7 @@ async def main():
         await client.signin("tester1@gmail.com", "20310482lJSD:Flsdjfls")
 
         # Создание чата
-        new_chat = await client.aelite.chats.new_chat()
+        new_chat = await client.aelite.threads.new_thread()
 
         # Deploy + connect в одну операцию
         agent = await client.aelite.deploy_and_connect(manifest, thread_id=new_chat.id)

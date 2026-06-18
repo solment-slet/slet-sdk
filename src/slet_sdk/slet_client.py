@@ -39,7 +39,7 @@ class SletClient:
         base_url: str,
         *,
         # Network
-        timeout: float | None = None,
+        timeout: float = 500.0,
         ssl_verify: bool = True,
         client: httpx.AsyncClient | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
@@ -59,7 +59,7 @@ class SletClient:
             if client
             else httpx.AsyncClient(
                 base_url=base_url,
-                timeout=httpx.Timeout(timeout if timeout else 500.0),
+                timeout=httpx.Timeout(timeout),
                 verify=ssl_verify,
                 transport=transport,
             )
@@ -232,7 +232,10 @@ class SletClient:
         return data
 
     async def signup(
-        self, name: str, email: str, password: str
+        self,
+        name: str,
+        email: str,
+        password: str,
     ) -> UserRegisterResponse:
         data = await self.request(
             "POST",

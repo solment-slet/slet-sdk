@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field, ConfigDict
 # ---
 
 
-class ChatWithoutHistory(BaseModel):
+class ThreadWithoutHistory(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: UUID  # обычно UUIDv7
@@ -36,7 +36,7 @@ class MessageSchema(BaseModel):
     tool_name: str | None = None
 
 
-class ChatWithHistory(ChatWithoutHistory):
+class ThreadWithHistory(ThreadWithoutHistory):
     messages: list[MessageSchema]
 
 
@@ -45,15 +45,15 @@ class ChatWithHistory(ChatWithoutHistory):
 # ---
 
 
-class ChatCreateAndRename(BaseModel):
+class ThreadCreateAndRename(BaseModel):
     title: str | None = Field(default=None, max_length=128)
 
 
-class ChatCreate(ChatCreateAndRename):
+class ThreadCreate(ThreadCreateAndRename):
     pass
 
 
-class ChatRename(ChatCreateAndRename):
+class ThreadRename(ThreadCreateAndRename):
     pass
 
 
@@ -62,5 +62,5 @@ class ChatRename(ChatCreateAndRename):
 # ---
 
 
-class GetUserChatsResponse(BaseModel):
-    chats: list[ChatWithoutHistory]
+class GetUserThreadsResponse(BaseModel):
+    threads: list[ThreadWithoutHistory]
