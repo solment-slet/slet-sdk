@@ -1,7 +1,33 @@
+from __future__ import annotations
+from typing import Literal
 from datetime import datetime
 from uuid import UUID
 
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, model_validator
+
+from slet_sdk.aelite.manifest import PermissionLevel, PermissionLevelRestricted
+
+
+# ---
+# PERMISSIONS ENUMS
+# ---
+
+Permissions = Literal["connect", "edit", "delete", "read_history"]
+
+
+class ThreadPermissionEntry(BaseModel):
+    user_id: int
+    permission: Permissions
+    type: Literal["allow", "deny"]
+
+
+class ThreadPermissions(BaseModel):
+    connect: PermissionLevel = PermissionLevel.owner_only
+    edit: PermissionLevelRestricted = PermissionLevelRestricted.owner_only
+    delete: PermissionLevelRestricted = PermissionLevelRestricted.owner_only
+    read_history: PermissionLevel = PermissionLevel.owner_only
+    entries: list[ThreadPermissionEntry] = []
+
 
 # ---
 # RESPONSES & INTERNAL USE
@@ -14,6 +40,7 @@ class ThreadWithoutHistory(BaseModel):
     id: UUID  # обычно UUIDv7
     title: str
     created_at: datetime = Field(description="ISO 8601, RFC 3339")
+    permissions: ThreadPermissions
 
 
 class ToolCallSchema(BaseModel):
@@ -40,27 +67,33 @@ class ThreadWithHistory(ThreadWithoutHistory):
     messages: list[MessageSchema]
 
 
+class ThreadCreateResponse(ThreadWithoutHistory):
+    session_ids: dict[str, str] = Field(
+        description="Session IDs associated with this agent"
+    )
+
+
+class GetUserThreadsResponse(BaseModel):
+    threads: list[ThreadWithoutHistory]
+
+
 # ---
 # REQUESTS
 # ---
 
 
-class ThreadCreateAndRename(BaseModel):
+class ThreadCreateAndUpdate(BaseModel):
     title: str | None = Field(default=None, max_length=128)
+    permissions: ThreadPermissions | None = Field(default=None),
 
 
-class ThreadCreate(ThreadCreateAndRename):
-    pass
+class ThreadCreate(ThreadCreateAndUpdate):
+    agent_id: UUID
 
 
-class ThreadRename(ThreadCreateAndRename):
-    pass
-
-
-# ---
-# RESPONSES
-# ---
-
-
-class GetUserThreadsResponse(BaseModel):
-    threads: list[ThreadWithoutHistory]
+class ThreadUpdate(ThreadCreateAndUpdate):
+    @model_validator(mode="after")
+    def at_least_one_field(self) -> ThreadUpdate:
+        if self.title is None and self.permissions is None:
+            raise ValueError("At least one of 'title' or 'permissions' must be provided")
+        return self

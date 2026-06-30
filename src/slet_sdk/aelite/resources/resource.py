@@ -4,7 +4,7 @@ from typing import Any, Dict
 from slet_sdk.core.mixins import BaseResource
 from slet_sdk.aelite.agent import AgentSession
 from slet_sdk.aelite.manifest import AgentManifest
-from slet_sdk.aelite.schemas.agent import AgentDeployResponse
+from slet_sdk.aelite.schemas.agents import AgentDeployResponse
 from slet_sdk.aelite.typing import StreamMode
 
 # Sub Resources for AeliteResource
@@ -71,7 +71,7 @@ class AeliteResource(BaseResource):
                   будет собран автоматически на основе манифеста.
                 - ``dict[str, str]`` — готовый словарь вида ``{agent_name: thread_id}``.
                 - ``AgentDeployResponse`` — объект ответа деплоя; словарь
-                  извлекается из поля ``thread_ids``.
+                  извлекается из поля ``agent_ids``.
             manifest: Манифест, использованный при деплое агента.
                 Если не передан, запрашивается у сервера по ``thread_id``.
             device: Произвольная строка-идентификатор устройства клиента.
@@ -117,7 +117,7 @@ class AeliteResource(BaseResource):
             )
 
         if isinstance(thread_id, AgentDeployResponse):
-            id_map = thread_id.thread_ids
+            id_map = thread_id.agent_ids
         elif isinstance(thread_id, dict):
             id_map = thread_id
         elif isinstance(thread_id, str):
@@ -154,7 +154,7 @@ class AeliteResource(BaseResource):
         response = await self.deploy(manifest, thread_id=thread_id)
 
         return await self.connect(
-            response.thread_ids,
+            response.agent_ids,
             manifest,
             device=device,
             stream_mode=stream_mode,

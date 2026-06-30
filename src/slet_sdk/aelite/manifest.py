@@ -41,9 +41,85 @@ Unknown placeholders produce an inline error note instead of crashing.
 from __future__ import annotations
 
 from typing import Any, Literal, Annotated
-from enum import StrEnum
+from enum import StrEnum, Enum
 
 from pydantic import BaseModel, Field, model_validator, field_validator
+
+
+# ===========================================================================
+# Permissions
+# ===========================================================================
+
+
+class PermissionLevel(str, Enum):
+    owner_only = "owner_only"
+    whitelist = "whitelist"
+    public = "public"
+
+
+class PermissionLevelRestricted(str, Enum):
+    owner_only = "owner_only"
+    whitelist = "whitelist"
+
+
+class AgentPermissions(BaseModel):
+    """
+    Access control policy for a root agent.
+
+    Each field defines who is allowed to perform a specific action:
+
+    - ``owner_only``: only the user who deployed the agent.
+    - ``whitelist``: only users explicitly listed in ``allowed_users``.
+    - ``public``: any authenticated user.
+
+    ``deploy`` and ``delete`` do not support ``public`` — granting arbitrary
+    users the ability to overwrite or destroy an agent is intentionally
+    disallowed.
+    """
+
+    view_manifest: PermissionLevel = Field(
+        default=PermissionLevel.owner_only,
+        description=(
+            "Who can retrieve this agent's manifest via ``GET /agent/{agent_id}``. "
+            "Defaults to ``owner_only`` — manifests are private unless explicitly "
+            "opened. Set to ``public`` to make the agent's configuration visible "
+            "to any authenticated user, or ``whitelist`` to share with a specific group."
+        ),
+    )
+    create_thread: PermissionLevel = Field(
+        default=PermissionLevel.owner_only,
+        description=(
+            "Who can start a new conversation thread backed by this agent "
+            "via ``POST /threads/``. Defaults to ``owner_only``, making the agent "
+            "personal by default. Set to ``public`` to allow any authenticated user "
+            "to use the agent, or ``whitelist`` for invite-only access."
+        ),
+    )
+    deploy: PermissionLevelRestricted = Field(
+        default=PermissionLevelRestricted.owner_only,
+        description=(
+            "Who can push a new version of this agent via ``PUT /agent/{agent_id}``. "
+            "Defaults to ``owner_only``. Set to ``whitelist`` to allow a team "
+            "of developers to deploy updates. ``public`` is not permitted — "
+            "unrestricted write access to agent logic is a security risk."
+        ),
+    )
+    delete: PermissionLevelRestricted = Field(
+        default=PermissionLevelRestricted.owner_only,
+        description=(
+            "Who can permanently delete this agent. "
+            "Defaults to ``owner_only``. ``public`` is not permitted."
+        ),
+    )
+    allowed_users: list[int] = Field(
+        default_factory=list,
+        description=(
+            "Explicit list of user IDs granted access when any permission field "
+            "is set to ``whitelist``. A single list applies across all whitelist "
+            "permissions — if granular per-action whitelists are needed, "
+            "deploy separate agents with different configurations."
+        ),
+    )
 
 
 # ===========================================================================
@@ -1330,10 +1406,12 @@ class AgentManifest(BaseModel):
         description=(
             "Unique agent identifier within a deployment.  Used to construct "
             "sub-agent thread IDs and as the key in the deploy response's "
-            "``thread_ids`` mapping."
+            "``agent_ids`` mapping."
         ),
+        min_length=1,
     )
     system_prompt: str = Field(
+        default="",
         description=(
             "System prompt template injected before every LLM call.  Supports "
             "``{time}``, ``{summary}``, ``{amem}``, ``{rag_<name>}`` "
@@ -1421,7 +1499,7 @@ class AgentManifest(BaseModel):
             "invokes the sub-agent's thread over HTTP/WebSocket and returns its "
             "response.  Grouping agents here is primarily useful for "
             "``inherit_tools_from`` resolution and for deployment bookkeeping "
-            "(the deploy endpoint returns all ``thread_ids`` in one response)."
+            "(the deploy endpoint returns all ``agent_ids`` in one response)."
         ),
     )
     tools: list[ToolConfig] = Field(
@@ -1449,8 +1527,18 @@ class AgentManifest(BaseModel):
             "``{'type': 'trigger', 'name': '<name>'}`` over WebSocket."
         ),
     )
-    components: Components = Field(
-        default_factory=Components,
+    permissions: AgentPermissions = Field(
+        default_factory=AgentPermissions,
+        description=(
+            "Access control settings for this agent. Controls who can view the manifest, "
+            "create threads, deploy new versions, and delete the agent.\n\n"
+            "Only applicable to root agents — sub-agents inherit the root agent's "
+            "deployment context and cannot have independent permissions. "
+            "Specifying 'permissions' on a sub-agent raises a validation error."
+        ),
+    )
+    components: Components | None = Field(
+        default=None,
         description="Optional peripheral components (TTS; future: OCR, ASR).",
     )
 
@@ -1491,6 +1579,16 @@ class AgentManifest(BaseModel):
                 raise ValueError(
                     f"Tool '{t.name}' timeout ({t.timeout}s) must be strictly "
                     f"less than processing_timeout ({self.processing_timeout}s)."
+                )
+        return self
+
+    @model_validator(mode="after")
+    def validate_sub_agent_permissions(self) -> AgentManifest:
+        for sub in self.sub_agents:
+            if "permissions" in sub.model_fields_set:
+                raise ValueError(
+                    f"Sub-agent '{sub.id}' cannot have 'permissions'. "
+                    "Permissions are only configurable on root agents."
                 )
         return self
 
