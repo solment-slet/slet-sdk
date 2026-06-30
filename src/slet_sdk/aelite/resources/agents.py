@@ -30,7 +30,7 @@ class AgentsResource(BaseResource):
         )
 
     async def delete_agent(self, agent_id: UUID) -> None:
-        """Permanent deletion of the thread along with the entire message history."""
+        """Complete removal of the agent along with all threads created on its basis."""
         return await self._request(
             "DELETE",
             f"/agents/{agent_id}",

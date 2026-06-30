@@ -4,41 +4,84 @@ from slet_sdk.core.mixins import BaseResource
 from slet_sdk.schemas import SuccessResponse
 from slet_sdk.aelite.schemas.threads import (
     GetUserThreadsResponse,
-    ThreadWithoutHistory,
+    ThreadInfo,
     ThreadWithHistory,
+    ThreadPermissions,
+    ThreadCreate, ThreadUpdate,
 )
 
 
 class ThreadsResource(BaseResource):
 
-    async def create_thread(self, title: str | None = None) -> ThreadWithoutHistory:
-        """Создание нового треда"""
-        return await self._request(
-            "POST",
-            "/threads/",
-            json={"title": title} if title else None,
-            schema=ThreadWithoutHistory,
-        )
+    async def create_thread(
+        self,
+        *,
+        agent_id: UUID | None = None,
+        title: str | None = None,
+        permissions: ThreadPermissions | None = None,
+        thread_schema: ThreadCreate | None = None,
+    ) -> ThreadInfo:
+        """Create a new thread."""
+        if thread_schema is not None:
+            return await self._request(
+                "POST",
+                "/threads/",
+                body=thread_schema,
+                schema=ThreadInfo,
+            )
+        if agent_id is not None:
+            return await self._request(
+                "POST",
+                "/threads/",
+                json={
+                    "agent_id": agent_id,
+                    "title": title,
+                    "permissions": permissions.model_dump_json() if permissions is not None else None,
+                },
+                schema=ThreadInfo,
+            )
 
-    async def delete_thread(self, thread_id: UUID) -> SuccessResponse:
-        """Безвозвратное удаление треда вместе со всей историей сообщений."""
+        raise ValueError("Either 'agent_id' or 'thread_schema' must be provided.")
+
+    async def update_thread(
+        self,
+        *,
+        agent_id: UUID | None = None,
+        title: str | None = None,
+        permissions: ThreadPermissions | None = None,
+        thread_schema: ThreadUpdate | None = None,
+    ) -> ThreadInfo:
+        """Updating an existing thread."""
+        if thread_schema is not None:
+            return await self._request(
+                "PUT",
+                "/threads/",
+                body=thread_schema,
+                schema=ThreadInfo,
+            )
+        if agent_id is not None or title is not None or permissions is not None:
+            return await self._request(
+                "PUT",
+                "/threads/",
+                json={
+                    "agent_id": agent_id,
+                    "title": title,
+                    "permissions": permissions.model_dump_json() if permissions is not None else None,
+                },
+                schema=ThreadInfo,
+            )
+
+        raise ValueError("Either 'agent_id', 'title', 'permissions' or 'thread_schema' must be provided.")
+
+    async def delete_thread(self, thread_id: UUID) -> None:
+        """Permanent deletion of the thread along with the entire message history."""
         return await self._request(
             "DELETE",
             f"/threads/{thread_id}",
-            schema=SuccessResponse,
         )
 
-    async def update_thread(self, thread_id: UUID, title: str) -> ThreadWithoutHistory:
-        """Переименование треда."""
-        return await self._request(
-            "PATCH",
-            f"/threads/{thread_id}/rename",
-            json={"title": title},
-            schema=ThreadWithoutHistory,
-        )
-
-    async def list_threads(self) -> list[ThreadWithoutHistory]:
-        """Список тредов текущего пользователя, отсортированных по дате создания (новые первые)."""
+    async def list_threads(self) -> list[ThreadInfo]:
+        """List of current user's threads."""
         response: GetUserThreadsResponse = await self._request(
             "GET",
             "/threads/",
@@ -47,7 +90,7 @@ class ThreadsResource(BaseResource):
         return response.threads
 
     async def get_thread(self, thread_id: UUID) -> ThreadWithHistory:
-        """Получение треда с полной историей сообщений по его UUID."""
+        """Getting a thread with a full message history."""
         return await self._request(
             "GET",
             f"/threads/{thread_id}",

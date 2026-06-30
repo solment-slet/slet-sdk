@@ -34,10 +34,11 @@ class ThreadPermissions(BaseModel):
 # ---
 
 
-class ThreadWithoutHistory(BaseModel):
+class ThreadInfo(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
-    id: UUID  # обычно UUIDv7
+    id: UUID
+    agent_id: UUID
     title: str
     created_at: datetime = Field(description="ISO 8601, RFC 3339")
     permissions: ThreadPermissions
@@ -63,18 +64,18 @@ class MessageSchema(BaseModel):
     tool_name: str | None = None
 
 
-class ThreadWithHistory(ThreadWithoutHistory):
+class ThreadWithHistory(ThreadInfo):
     messages: list[MessageSchema]
 
 
-class ThreadCreateResponse(ThreadWithoutHistory):
+class ThreadCreateResponse(ThreadInfo):
     session_ids: dict[str, str] = Field(
         description="Session IDs associated with this agent"
     )
 
 
 class GetUserThreadsResponse(BaseModel):
-    threads: list[ThreadWithoutHistory]
+    threads: list[ThreadInfo]
 
 
 # ---
@@ -92,8 +93,10 @@ class ThreadCreate(ThreadCreateAndUpdate):
 
 
 class ThreadUpdate(ThreadCreateAndUpdate):
+    agent_id: UUID | None = None
+
     @model_validator(mode="after")
     def at_least_one_field(self) -> ThreadUpdate:
-        if self.title is None and self.permissions is None:
-            raise ValueError("At least one of 'title' or 'permissions' must be provided")
+        if self.agent_id is None and self.title is None and self.permissions is None:
+            raise ValueError("At least one of 'agent_id', 'title' or 'permissions' must be provided")
         return self
