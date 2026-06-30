@@ -1,12 +1,9 @@
 from __future__ import annotations
+
 import httpx
 import json
 import logging
-from typing import (
-    Any,
-    Type,
-    overload,
-)
+from typing import Any
 
 from pydantic import BaseModel, ValidationError
 import websockets
@@ -95,43 +92,38 @@ class SletClient:
             )
         return {"Authorization": f"Bearer {self.access_token}"}
 
-    @overload
     async def request[T: BaseModel](
         self,
         method: str,
         url: str,
-        schema: type[T],
+        schema: type[T] | None = None,
+        *,
+        body: BaseModel | dict | None = None,
         **kwargs: Any,
-    ) -> T: ...
-
-    @overload
-    async def request(
-        self,
-        method: str,
-        url: str,
-        schema: None = None,
-        **kwargs: Any,
-    ) -> dict: ...
-
-    async def request[T: BaseModel](
-        self,
-        method: str,
-        url: str,
-        schema: Type[T] | None = None,
-        **kwargs: Any,
-    ) -> dict | T:
-        return await self._request_impl(method, url, schema=schema, **kwargs)
+    ) -> dict | T | None:
+        return await self._request_impl(method, url, schema=schema, body=body, **kwargs)
 
     async def _request_impl[T: BaseModel](
         self,
         method: str,
         url: str,
-        schema: Type[T] | None = None,
+        schema: type[T] | None = None,
         *,
+        body: BaseModel | dict | None = None,
         _skip_refresh: bool = False,
         **kwargs: Any,
-    ) -> dict | T:
+    ) -> dict | T | None:
         last_resp: httpx.Response | None = None
+
+        if body is not None:
+            if isinstance(body, BaseModel):
+                kwargs["content"] = body.model_dump_json(exclude_none=True)
+                kwargs["headers"] = {
+                    **kwargs.get("headers", {}),
+                    "Content-Type": "application/json",
+                }
+            else:
+                kwargs["json"] = body
 
         for attempt in range(2):
             merged_headers = {**kwargs.get("headers", {})}
@@ -147,6 +139,20 @@ class SletClient:
             last_resp = resp
 
             if 200 <= resp.status_code < 300:
+                if self._is_empty_body(method, resp):
+                    if schema:
+                        raise SletClientError(
+                            ErrorResponse(
+                                status=resp.status_code,
+                                error=ErrorCode.VALIDATION_ERROR,
+                                message=(
+                                    "Expected response body for schema "
+                                    "validation, got empty body"
+                                ),
+                            )
+                        )
+                    return None
+
                 data = self._parse_json(resp)
                 return (
                     self._validate_schema(data, schema, resp.status_code)
@@ -155,10 +161,10 @@ class SletClient:
                 )
 
             if (
-                resp.status_code == 401
-                and not _skip_refresh
-                and attempt == 0
-                and self.refresh_token
+                    resp.status_code == 401
+                    and not _skip_refresh
+                    and attempt == 0
+                    and self.refresh_token
             ):
                 err_data = self._parse_json(resp, allow_fail=True)
                 if err_data.get("error") == ErrorCode.INVALID_ACCESS_TOKEN:
@@ -169,6 +175,16 @@ class SletClient:
 
         assert last_resp is not None
         raise SletClientError(self._build_error(last_resp))
+
+    @staticmethod
+    def _is_empty_body(method: str, resp: httpx.Response) -> bool:
+        if method.upper() == "HEAD":
+            return True
+        if resp.status_code in (204, 304):
+            return True
+        if not resp.content:
+            return True
+        return False
 
     def _parse_json(self, resp: httpx.Response, allow_fail: bool = False) -> dict:
         try:
@@ -186,7 +202,10 @@ class SletClient:
             )
 
     def _validate_schema[T: BaseModel](
-        self, data: dict, schema: Type[T], status: int
+        self,
+        data: dict,
+        schema: type[T],
+        status: int,
     ) -> T:
         try:
             return schema.model_validate(data)
@@ -269,23 +288,6 @@ class SletClient:
         self.access_token = data.access_token
         self.refresh_token = data.refresh_token
         return data
-
-    # ──────────────── Generic HTTP ───────────────────────────
-
-    async def get(self, url: str, **kwargs: Any) -> dict:
-        return await self.request("GET", url, **kwargs)
-
-    async def post(self, url: str, **kwargs: Any) -> dict:
-        return await self.request("POST", url, **kwargs)
-
-    async def put(self, url: str, **kwargs: Any) -> dict:
-        return await self.request("PUT", url, **kwargs)
-
-    async def patch(self, url: str, **kwargs: Any) -> dict:
-        return await self.request("PATCH", url, **kwargs)
-
-    async def delete(self, url: str, **kwargs: Any) -> dict:
-        return await self.request("DELETE", url, **kwargs)
 
     async def close(self):
         await self._client.aclose()

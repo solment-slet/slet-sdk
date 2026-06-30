@@ -11,7 +11,7 @@ from slet_sdk.aelite.schemas.threads import (
 
 class ThreadsResource(BaseResource):
 
-    async def new_thread(self, title: str | None = None) -> ThreadWithoutHistory:
+    async def create_thread(self, title: str | None = None) -> ThreadWithoutHistory:
         """Создание нового треда"""
         return await self._request(
             "POST",
@@ -28,7 +28,7 @@ class ThreadsResource(BaseResource):
             schema=SuccessResponse,
         )
 
-    async def rename_thread(self, thread_id: UUID, title: str) -> ThreadWithoutHistory:
+    async def update_thread(self, thread_id: UUID, title: str) -> ThreadWithoutHistory:
         """Переименование треда."""
         return await self._request(
             "PATCH",
@@ -37,7 +37,7 @@ class ThreadsResource(BaseResource):
             schema=ThreadWithoutHistory,
         )
 
-    async def get_threads(self) -> list[ThreadWithoutHistory]:
+    async def list_threads(self) -> list[ThreadWithoutHistory]:
         """Список тредов текущего пользователя, отсортированных по дате создания (новые первые)."""
         response: GetUserThreadsResponse = await self._request(
             "GET",

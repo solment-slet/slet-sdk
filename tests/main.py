@@ -51,7 +51,7 @@ async def main():
         await client.signin("tester1@gmail.com", "20310482lJSD:Flsdjfls")
 
         # Создание чата
-        new_chat = await client.aelite.threads.new_thread()
+        new_chat = await client.aelite.threads.create_thread()
 
         # Deploy + connect в одну операцию
         agent = await client.aelite.deploy_and_connect(manifest, thread_id=new_chat.id)

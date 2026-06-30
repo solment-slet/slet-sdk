@@ -26,12 +26,15 @@ class BaseResource:
         method: str,
         url: str,
         schema: type[T] | None = None,
+        *,
+        body: BaseModel | dict | None = None,
         **kwargs: Any,
-    ) -> dict | T:
+    ) -> dict | T | None:
         return await self._client.request(
             method=method,
             url=self._route_prefix + url,
             schema=schema,
+            body=body,
             **kwargs,
         )
 

@@ -1,5 +1,5 @@
 async def test_deploy_and_connect(client, manifest):
-    new_thread = await client.aelite.threads.new_thread()
+    new_thread = await client.aelite.threads.create_thread()
 
     agent = await client.aelite.deploy_and_connect(manifest, thread_id=new_thread.id)
 

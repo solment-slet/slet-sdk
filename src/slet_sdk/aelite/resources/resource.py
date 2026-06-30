@@ -40,7 +40,7 @@ class AeliteResource(BaseResource):
             manifest = manifest.model_dump()
 
         if not thread_id:
-            thread = await self.threads.new_thread()
+            thread = await self.threads.create_thread()
             thread_id = str(thread.id)
 
         return await self._request(
