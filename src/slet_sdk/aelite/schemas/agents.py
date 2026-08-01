@@ -9,10 +9,6 @@ from slet_sdk.aelite.manifest import AgentPermissions, AgentManifest
 Permissions = Literal["view_manifest", "create_thread", "deploy", "delete"]
 
 
-class AgentDeployResponse(BaseModel):
-    pass # TODO: Заглушка для slet_sdk resource
-
-
 class AgentInfo(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

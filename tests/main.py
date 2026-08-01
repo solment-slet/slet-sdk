@@ -2,8 +2,9 @@ import asyncio
 import sys
 from aioconsole import ainput
 from slet_sdk import SletClient
-from slet_sdk.aelite.manifest import AgentManifest, ToolConfig, MemoryConfig, BroadcastConfig
+from slet_sdk.aelite.manifest import AgentManifest, ToolConfig, MemoryConfig, BroadcastConfig, ModelConfig
 from slet_sdk.aelite.tools import tool
+from slet_sdk.aelite.agent import ThinkingDelta
 
 
 @tool
@@ -21,7 +22,7 @@ async def show_notification(title: str, message: str) -> None:
 manifest = AgentManifest(
     id="MainAgent",
     system_prompt="""Ты гениальный ассистент по имени Aelite.
-    
+
     Перед тем как использовать любой инструмент добавляй текст для пользователя о том что его используешь.""",
     concurrency="parallel",
     memory=MemoryConfig(enabled=True, summarization="async"),
@@ -38,8 +39,10 @@ manifest = AgentManifest(
                 AgentManifest(
                     id="Krosh",
                     system_prompt="Ты персонаж из мультфильма Смешарики по имени Крош.",
+                    inherit_tools_from=["SherlokHolms"],
                 )
             ],
+            inherit_tools_from=["MainAgent"],
         )
     ],
 )
@@ -50,20 +53,39 @@ async def main():
         # Авторизация
         await client.signin("tester1@gmail.com", "20310482lJSD:Flsdjfls")
 
-        # Создание чата
-        new_chat = await client.aelite.threads.create_thread()
+        # Aelite
+        aelite = client.aelite
 
-        # Deploy + connect в одну операцию
-        agent = await client.aelite.deploy_and_connect(manifest, thread_id=new_chat.id)
+        # Создание агента
+        session = await aelite.agents.create_agent(manifest)
 
-        # Подписка на события
-        agent.on_message = lambda msg: print(f"Пришло сообщение!: {msg}")
-        agent.on_tool_start = lambda tool_name: print(
-            f"Вызван сервеный инструмент: {tool_name}"
+        # Создание треда
+        thread = await aelite.threads.create_thread(session.id)
+
+        # Подключение к агенту и подагентам
+        session = await aelite.connect(thread.id)
+
+        # ── Подписка на события ──
+        # on_message теперь: (text, thinking, msg_id)
+        session.on_message = lambda text, thinking, msg_id: print(
+            f"\nПришло unsolicited-сообщение [{msg_id}]: {text}"
+            + (f"\n  (thinking: {thinking})" if thinking else "")
         )
-        agent.on_error = lambda err: print(f"Ошибка! {str(err)}")
 
-        # Основной цикл
+        # on_tool_start теперь: (tool_name, msg_id)
+        session.on_tool_start = lambda tool_name, msg_id: print(
+            f"\n🔧 Вызван инструмент: {tool_name} [{msg_id}]"
+        )
+
+        # on_error — сигнатура не изменилась
+        session.on_error = lambda err: print(f"\n❌ Ошибка! {str(err)}")
+
+        # Новый колбэк: ошибки сервера, привязанные к msg (или None)
+        session.on_server_error = lambda err, msg_id: print(
+            f"\n❌ Ошибка сервера [{msg_id}]: {str(err)}"
+        )
+
+        # Основной цикл (бесконечный, с прикреплением файлов) — без изменений
         while True:
             # Сбрасываем буфер перед чтением
             await asyncio.get_event_loop().run_in_executor(None, sys.stdin.flush)
@@ -87,9 +109,21 @@ async def main():
             if user_input == "exit":
                 break
 
-            async for chunk in agent.stream(user_input, files=files):
-                print(chunk, end="", flush=True)
+            # stream() теперь отдаёт TextDelta / ThinkingDelta вместо голых str
+            thinking_open = False
+            async for item in session.stream(user_input, files=files):
+                if isinstance(item, ThinkingDelta):
+                    if not thinking_open:
+                        print("\n[thinking] ", end="", flush=True)
+                        thinking_open = True
+                    print(item.text, end="", flush=True)
+                else:  # TextDelta
+                    if thinking_open:
+                        print("\n[/thinking]\n", end="", flush=True)
+                        thinking_open = False
+                    print(item.text, end="", flush=True)
             print()
+
             for file in files:
                 try:
                     file.close()

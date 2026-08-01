@@ -27,6 +27,8 @@ class ErrorCode(StrEnum):
     FILE_NOT_FOUND = "file_not_found"
     FILE_EXPIRED = "file_expired"
     FILE_NOT_FOUND_OR_EXPIRED = "file_not_found_or_expired"
+    AGENT_NOT_FOUND = "agent_not_found"
+    TRIGGER_NOT_FOUND = "trigger_not_found"
 
     ## 409
     CONFLICT = "conflict"  # base
@@ -47,10 +49,14 @@ class ErrorCode(StrEnum):
 
     ## 502
     BAD_GATEWAY = "bad_gateway"  # base
-    PROVIDER_UNAVAILABLE_ERROR = "provider_unavailable_error"
+    PROVIDER_CONNECTION_ERROR = "provider_connection_error"
+    PROVIDER_STATUS_ERROR = "provider_status_error"
 
     ## 503
     SERVICE_UNAVAILABLE = "service_unavailable"  # base
+
+    ## 504
+    PROVIDER_TIMEOUT_ERROR = "provider_timeout_error"
 
     ## >599 (Custom Errors)
     NETWORK_ERROR = "network_error"

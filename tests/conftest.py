@@ -1,3 +1,5 @@
+import os
+
 import pytest
 import pytest_asyncio
 from dotenv import load_dotenv
@@ -27,20 +29,53 @@ async def client(auth_data):
 
 
 @pytest.fixture(scope="session")
-def manifest():
+def model():
+    models = []
+    index = ""
+    while True:
+        base_url = os.environ.get(f"MODEL_BASE_URL{index}")
+        model_name = os.environ.get(f"MODEL_NAME{index}")
+        api_key = os.environ.get(f"MODEL_API_KEY{index}")
+
+        if not base_url or not model_name or not api_key:
+            if index == "":
+                raise RuntimeError(
+                    "MODEL_BASE_URL, MODEL_NAME, MODEL_API_KEY must be set"
+                )
+            break
+
+        models.append(
+            ModelConfig(
+                base_url=base_url,
+                model=model_name,
+                api_key=api_key,
+            )
+        )
+
+        index = "_2" if index == "" else f"_{int(index[1:]) + 1}"
+
+    return models
+
+
+@pytest.fixture(scope="session")
+def manifest(model):
     return AgentManifest(
         id="Test_Agent",
         system_prompt="You are helpful assistant.",
-        model=ModelConfig(
-            base_url="https://api.groq.com/openai/v1",
-            model="openai/gpt-oss-120b",
-            api_key="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",
-        )
+        model=model,
     )
 
 
-@pytest_asyncio.fixture
+@pytest_asyncio.fixture(scope="session")
 async def agent(client, manifest):
-    client.aelite.deploy_and_connect(manifest)
+    return client.aelite.agents.create_agent(manifest)
 
-    return client
+
+@pytest_asyncio.fixture
+async def thread(client, agent):
+    return client.aelite.threads.create_thread(agent.id)
+
+
+@pytest_asyncio.fixture
+async def session(client, thread):
+    return client.aelite.connect(thread.id)

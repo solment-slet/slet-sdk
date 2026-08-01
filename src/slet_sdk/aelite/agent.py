@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import json
 import mimetypes
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import (
@@ -17,7 +18,7 @@ from typing import (
 
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
-from slet_sdk.aelite.tools import get_registered_tools
+from slet_sdk.aelite.tools import ToolBelt
 from slet_sdk.exceptions import SletClientError
 from slet_sdk.schemas import ErrorResponse, ErrorCode
 from slet_sdk.schemas.errors import CallbackError, NetworkError
@@ -25,59 +26,88 @@ from slet_sdk.aelite.typing import StreamMode
 from slet_sdk.aelite.utils.device_info import get_device_string
 
 if TYPE_CHECKING:
-    from slet_sdk.aelite.manifest import AgentManifest
+    from slet_sdk.aelite.manifest import AgentManifest, ToolConfig
     from slet_sdk.aelite.resources.resource import AeliteResource
 
 
 # ---------------------------------------------------------------------------
-# Внутренние маркеры для очередей
+# Stream items returned to the user from stream()/on_incoming_stream
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TextDelta:
+    """A chunk of the model's regular text response."""
+
+    text: str
+
+
+@dataclass
+class ThinkingDelta:
+    """A chunk of the model's thinking/reasoning text."""
+
+    text: str
+
+
+StreamItem = TextDelta | ThinkingDelta
+
+
+# ---------------------------------------------------------------------------
+# Internal queue markers
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class _End:
-    """Сигнал завершения потока данных в очереди."""
+    """Signal that a data stream in the queue has finished."""
 
     pass
 
 
 @dataclass
 class _Error:
-    """Сигнал ошибки в очереди."""
+    """Signal of an error in the queue."""
 
     error: ErrorResponse
 
 
-# Тип элемента очереди: либо текстовый чанк, либо служебный маркер.
-_QueueItem = str | _End | _Error
+# Type of a queue item: either a stream chunk or a service marker.
+_QueueItem = StreamItem | _End | _Error
 
 
 # ---------------------------------------------------------------------------
-# Основной класс
+# Main class
 # ---------------------------------------------------------------------------
 
 
 class AgentSession:
     """
-    Сессия общения с агентом через WebSocket.
+    A session for communicating with an agent over WebSocket.
 
-    Жизненный цикл
-    --------------
-    1. Создайте экземпляр через ``client.aelite.deploy_and_connect()``.
-    2. Вызовите ``await session.connect()`` — соединение устанавливается,
-       фоновый listener запускается автоматически.
-    3. Используйте ``chat()`` / ``stream()`` для диалога.
-    4. Зарегистрируйте коллбэки (``on_message``, ``on_error`` и др.)
-       для получения незапрошенных сообщений и уведомлений.
-    5. Завершите работу через ``await session.disconnect()``.
+    Lifecycle
+    ---------
+    1. Create an instance via ``client.aelite.deploy_and_connect()``.
+    2. Call ``await session.connect()`` — the connection is established,
+       and the background listener starts automatically.
+    3. Use ``chat()`` / ``stream()`` for dialogue.
+    4. Register callbacks (``on_message``, ``on_error``, etc.)
+       to receive unsolicited messages and notifications.
+    5. Finish the work via ``await session.disconnect()``.
 
-    Особенности
-    -----------
-    - Режим «Запрос — Ответ»: ``chat()`` и ``stream()``.
-    - Инициатива агента: незапрошенные сообщения маршрутизируются
-      через ``on_message`` (буфер) или ``on_incoming_stream`` (стрим).
-    - Автоматическая обработка вызовов клиентских инструментов.
-    - Автоматический реконнект при разрыве соединения.
+    Notes
+    -----
+    - "Request — Response" mode: ``chat()`` and ``stream()``. Each call gets
+      its own ``msg`` identifier and is processed independently — you can
+      call ``stream()``/``chat()`` concurrently, they don't block each other.
+    - The response is split into regular text (``TextDelta``) and the
+      model's thinking (``ThinkingDelta``), if the server/provider provides it.
+    - Agent-initiated messages (broadcasts from triggers, including those
+      launched by other devices of the same user) are routed via
+      ``on_message`` (buffered) or ``on_incoming_stream`` (streamed), with
+      one callback invocation per independent ``msg`` — concurrent
+      unsolicited streams are not mixed with each other.
+    - Automatic handling of client tool calls.
+    - Automatic reconnect when the connection is dropped.
     """
 
     def __init__(
@@ -95,10 +125,10 @@ class AgentSession:
         self.manifest = manifest
         self._resource = resource
 
-        # Дочерние подагенты, доступные через session.SubAgentId
+        # Child sub-agents, accessible via session.SubAgentId
         self.sub: dict[str, AgentSession] = {}
 
-        # URL-адреса
+        # URLs
         ws_base = self._resource.base_ws_url
         base_url = self._resource.base_url
         self.device = device
@@ -106,7 +136,7 @@ class AgentSession:
         self.http_url = base_url
         self.ws_url = ws_base
         self._ws_connect_url = (
-            f"{self.ws_url}/agent/ws/{self.thread_id}"
+            f"{self.ws_url}/agents/ws/{self.thread_id}"
             f"?device={self.device}"
             f"&stream_mode={self.stream_mode}"
         )
@@ -119,67 +149,61 @@ class AgentSession:
         self.logger.debug(f"Device name: {self.device}")
         self.logger.debug(f"Stream mode: {self.stream_mode}")
 
-        # --- Настройки поведения ---
+        # --- Behavior settings ---
 
-        # Если True: незапрошенные сообщения доставляются через on_incoming_stream
-        # как асинхронный итератор (чанк за чанком).
-        # Если False: текст накапливается в буфере и отдаётся целиком через on_message.
+        # If True: unsolicited messages are delivered via on_incoming_stream
+        # as an async iterator (chunk by chunk), separately for each msg_id.
+        # If False: text is accumulated in a buffer (also separately per
+        # msg_id) and delivered whole via on_message.
         self.stream_unsolicited: bool = False
 
-        # --- Коллбэки ---
+        # --- Callbacks ---
         self._add_callbacks_attributes()
 
-        # --- Реестр клиентских инструментов ---
-        self._registered_tools: dict[str, Callable] = {}
+        # --- Client tool registry ---
+        self._registered_tools: dict[str, Callable[..., Any]] = {}
 
-        # --- Внутренние механизмы ---
+        # --- Internal machinery ---
 
         self._listener_task: asyncio.Task | None = None
 
-        # Очередь ответа на активный chat/stream запрос пользователя.
-        self._response_queue: asyncio.Queue[_QueueItem] = asyncio.Queue()
+        # Response queues for active chat/stream requests, one per msg_id.
+        self._response_queues: dict[str, asyncio.Queue[_QueueItem]] = {}
 
-        # Очередь стриминга незапрошенных сообщений (создаётся при необходимости).
-        self._unsolicited_stream_queue: asyncio.Queue[_QueueItem] | None = None
+        # Streaming queues for unsolicited messages, one per msg_id
+        # (created upon receiving the first token for a new msg_id).
+        self._unsolicited_streams: dict[str, asyncio.Queue[_QueueItem]] = {}
 
-        # Буфер текста незапрошенного сообщения (stream_unsolicited=False).
-        self._unsolicited_buffer: list[str] = []
+        # Text buffers for unsolicited messages (stream_unsolicited=False),
+        # one per msg_id.
+        self._unsolicited_buffers: dict[str, list[StreamItem]] = {}
 
-        # True, пока мы ожидаем ответ на явный запрос пользователя.
-        self._waiting_for_response: bool = False
-
-        # True, пока агент передаёт какие-либо данные (блокирует отправку новых запросов).
-        self._is_incoming_traffic: bool = False
-
-        # --- Настройки реконнекта ---
+        # --- Reconnect settings ---
         self.max_reconnect_attempts: int = (
-            10  # float("inf") для бесконечного реконнекта
+            10  # float("inf") for infinite reconnect
         )
-        self.reconnect_delay: int = 5  # секунд между попытками
-        self._reconnect_attempt: int = 0  # текущий номер попытки (только для логов)
+        self.reconnect_delay: int = 5  # seconds between attempts
+        self._reconnect_attempt: int = 0  # current attempt number (for logs only)
         self._manual_disconnect: bool = (
-            False  # True = закрыто намеренно, реконнект не нужен
+            False  # True = closed intentionally, no reconnect needed
         )
 
-        # Event сброшен (clear) на время реконнекта; chat/stream ждут его.
+        # Event is cleared during reconnect; chat/stream/trigger wait on it.
         self._reconnect_event: asyncio.Event = asyncio.Event()
         self._reconnect_event.set()
 
-        # Мьютекс: запрещает параллельные вызовы chat/stream.
-        self._lock: asyncio.Lock = asyncio.Lock()
-
     # ------------------------------------------------------------------
-    # Подключение / отключение
+    # Connect / disconnect
     # ------------------------------------------------------------------
 
     async def connect(self) -> None:
         """
-        Устанавливает WebSocket-соединение и запускает фоновый listener.
+        Establishes a WebSocket connection and starts the background listener.
 
         Raises
         ------
         SletClientError
-            Если сервер вернул ошибочный HTTP-статус при handshake.
+            If the server returned an error HTTP status during the handshake.
         """
         try:
             await self._connect_websocket()
@@ -206,9 +230,9 @@ class AgentSession:
 
     async def disconnect(self) -> None:
         """
-        Останавливает фоновый listener и закрывает WebSocket-соединение.
+        Stops the background listener and closes the WebSocket connection.
 
-        После вызова реконнект не выполняется.
+        No reconnect is performed after this call.
         """
         self._manual_disconnect = True
         self._is_connected = False
@@ -220,85 +244,159 @@ class AgentSession:
             self.logger.info("Disconnected from agent")
 
     async def disconnect_all(self) -> None:
-        """Рекурсивно отключает всё дерево подагентов, затем текущую сессию."""
+        """Recursively disconnects the entire sub-agent tree, then the current session."""
         for sub_session in self.sub.values():
             await sub_session.disconnect_all()
         await self.disconnect()
 
-    async def redeploy(self, new_manifest: AgentManifest | None = None) -> None:
-        """
-        Пересоздаёт агента на сервере, сохраняя ``thread_id`` (историю диалога).
-
-        Parameters
-        ----------
-        new_manifest:
-            Новый манифест. Если не передан — используется сохранённый манифест
-            текущей сессии.
-
-        Raises
-        ------
-        RuntimeError
-            Если сессия была создана без ссылки на ресурс.
-        ValueError
-            Если манифест не передан и не был сохранён при создании сессии.
-        """
-        if self._resource is None:
-            raise RuntimeError(
-                "Cannot redeploy: session was created without resource reference. "
-                "Use client.aelite.deploy_and_connect() to get a redeployable session."
-            )
-
-        manifest = new_manifest or self.manifest
-        if manifest is None:
-            raise ValueError("No manifest provided and no stored manifest.")
-
-        self.manifest = manifest
-        await self._resource.deploy(manifest, thread_id=self.thread_id)
-
     # ------------------------------------------------------------------
-    # Регистрация инструментов
+    # Tool registration
     # ------------------------------------------------------------------
 
-    def register_tools(self, tools: list[Callable]) -> None:
+    def register_tools(self, tools: list[Callable[..., Any] | ToolBelt]) -> None:
         """
-        Регистрирует функции клиентских инструментов.
+        Registers client tool implementations that fulfil this agent's
+        manifest contract.
 
-        Имя инструмента берётся из атрибута ``_tool_name`` (если задан),
-        иначе из ``__name__`` функции.
+        The manifest (``self.manifest.tools``) declares which client tools
+        the LLM may call and their expected parameter schema — it is the
+        contract. This method registers the local Python implementation that
+        fulfils that contract; the implementation does not need to share any
+        object with whatever declared the contract, it only needs to match
+        it by name and parameters.
+
+        If ``self.manifest`` is available, each registered tool is checked
+        against the declared contract:
+          - a client tool declared in the manifest but never registered here
+            will fail at call time ("not registered on client");
+          - a tool registered here but absent from the manifest will simply
+            never be called by the LLM;
+          - a name that matches but whose parameters don't (missing/extra
+            required params, type mismatch) is logged as a conformance
+            warning, since it will likely fail or misbehave on the first
+            real call.
 
         Parameters
         ----------
         tools:
-            Список вызываемых объектов (sync или async).
+            A list of ``@tool``-decorated callables (sync or async) and/or
+            ``ToolBelt`` instances. Each ``ToolBelt`` is flattened into its
+            member tools automatically.
         """
-        for fn in tools:
-            name: str = getattr(fn, "_tool_name", None) or fn.__name__
-            self._registered_tools[name] = fn
-            self.logger.debug(f"Registered client tool: {name}")
+        manifest_tools: list[ToolConfig] = self.manifest.tools if self.manifest is not None else []
+        declared = {
+            t.name: t for t in manifest_tools if t.type == "client"
+        }
 
-    def register_tools_from_registry(self) -> None:
-        """Загружает все инструменты из глобального реестра SDK."""
-        self._registered_tools.update(get_registered_tools())
+        for item in tools:
+            if isinstance(item, ToolBelt):
+                for fn in item:
+                    self._register_single_tool(fn, declared)
+            else:
+                self._register_single_tool(item, declared)
+
+        if declared:
+            missing = declared.keys() - self._registered_tools.keys()
+            for name in missing:
+                self.logger.warning(
+                    f"Client tool '{name}' is declared in the manifest but has no "
+                    f"local implementation registered — calls to it will fail "
+                    f"with 'not registered on client'."
+                )
+
+    def _register_single_tool(
+            self,
+            fn: Callable[..., Any],
+            declared: dict[str, ToolConfig],
+    ) -> None:
+        name: str = getattr(fn, "_tool_name", None) or fn.__name__
+        if name in self._registered_tools:
+            self.logger.warning(
+                f"Client tool '{name}' re-registered — overwriting previous handler."
+            )
+
+        contract = declared.get(name)
+        if contract is not None:
+            self._check_conformance(name, fn, contract)
+        elif declared:  # manifest known, but this tool isn't in it
+            self.logger.warning(
+                f"Client tool '{name}' registered locally but not declared as a "
+                f"client tool in the deployed manifest — the LLM will never call it."
+            )
+
+        self._registered_tools[name] = fn
+        self.logger.debug(f"Registered client tool: {name}")
+
+    def _check_conformance(
+            self,
+            name: str,
+            fn: Callable[..., Any],
+            contract: ToolConfig,
+    ) -> None:
+        """Compare the local implementation's parameters against the
+        manifest's declared contract for this tool. Warns (does not raise)
+        on mismatch, since the manifest is the source of truth and drift
+        here is a bug to surface, not a hard failure to block on."""
+        local_params: dict[str, dict[str, Any]] = getattr(fn, "_tool_params", None)
+        if local_params is None:
+            # fn wasn't decorated with @tool — we can't introspect its
+            # contract-relevant metadata, so skip conformance checking.
+            return
+
+        contract_params = contract.params  # dict[str, ToolParam]
+
+        missing_in_impl = contract_params.keys() - local_params.keys()
+        extra_in_impl = local_params.keys() - contract_params.keys()
+        if missing_in_impl:
+            self.logger.warning(
+                f"Client tool '{name}': manifest declares parameter(s) "
+                f"{sorted(missing_in_impl)} that the local implementation does "
+                f"not accept — calls using them will fail."
+            )
+        if extra_in_impl:
+            self.logger.warning(
+                f"Client tool '{name}': local implementation has parameter(s) "
+                f"{sorted(extra_in_impl)} not declared in the manifest — the LLM "
+                f"will never supply them, so make sure they have defaults."
+            )
+
+        for pname in contract_params.keys() & local_params.keys():
+            c_type = contract_params[pname].type
+            l_type = local_params[pname]["type"]
+            if c_type != l_type:
+                self.logger.warning(
+                    f"Client tool '{name}', parameter '{pname}': manifest declares "
+                    f"type '{c_type}' but local implementation expects '{l_type}'."
+                )
+            c_required = contract_params[pname].required
+            l_required = local_params[pname]["required"]
+            if c_required and not l_required:
+                self.logger.warning(
+                    f"Client tool '{name}', parameter '{pname}': manifest marks it "
+                    f"required, but the local implementation has a default — this "
+                    f"is harmless but suggests the contract and implementation "
+                    f"were written independently and may drift further."
+                )
 
     # ------------------------------------------------------------------
-    # Низкоуровневая отправка
+    # Low-level sending
     # ------------------------------------------------------------------
 
     async def send(self, message: str) -> None:
         """
-        Отправляет сырое сообщение в WebSocket.
+        Sends a raw message over the WebSocket.
 
-        Если в данный момент идёт реконнект — ждёт его завершения.
+        If a reconnect is currently in progress — waits for it to finish.
 
         Parameters
         ----------
         message:
-            Строка для отправки (текст или JSON).
+            The string to send (text or JSON).
 
         Raises
         ------
         SletClientError
-            Если соединение не установлено.
+            If the connection is not established.
         """
         await self._reconnect_event.wait()
 
@@ -308,55 +406,49 @@ class AgentSession:
         await self.websocket.send(message)
 
     # ------------------------------------------------------------------
-    # Публичные методы запросов
+    # Public request methods
     # ------------------------------------------------------------------
 
     async def stream(
         self,
         message: str,
         files: list[Any] | None = None,
-    ) -> AsyncGenerator[str, None]:
+    ) -> AsyncGenerator[StreamItem, None]:
         """
-        Отправляет сообщение агенту и возвращает асинхронный генератор чанков ответа.
+        Sends a message to the agent and returns an async generator of
+        response items (``TextDelta`` / ``ThinkingDelta``).
 
-        Если агент в данный момент передаёт незапрошенное сообщение,
-        метод ждёт его завершения перед отправкой.
-        Параллельные вызовы ``chat``/``stream`` выстраиваются в очередь через мьютекс.
+        Each call gets its own ``msg`` and is processed independently of
+        other active ``stream()``/``chat()`` calls — they can be called
+        concurrently.
 
         Parameters
         ----------
         message:
-            Текст сообщения пользователя.
+            The user's message text.
         files:
-            Список файлов для прикрепления. Каждый файл может быть ``str``,
-            ``bytes`` или file-like объектом.
+            A list of files to attach. Each file can be ``str``,
+            ``bytes``, or a file-like object.
 
         Yields
         ------
-        str
-            Текстовые чанки ответа агента.
+        StreamItem
+            ``TextDelta`` — a chunk of the regular response text.
+            ``ThinkingDelta`` — a chunk of the model's thinking text (if any).
 
         Raises
         ------
         SletClientError
-            При ошибке соединения или если агент вернул ошибку.
+            On a connection error or if the agent/server returned an error
+            (including a msg conflict — practically impossible with UUID4,
+            but would still correctly surface as an exception).
         """
-        # Загружаем файлы и оборачиваем сообщение в JSON при наличии вложений
         attachments: list[dict] = []
         if files:
             for f in files:
                 res = await self.upload_file(f)
                 attachments.append({"ref": f"upload:{res['file_id']}"})
 
-            message = json.dumps(
-                {
-                    "type": "message",
-                    "text": message,
-                    "attachments": attachments,
-                }
-            )
-
-        # Ожидаем завершения реконнекта (если идёт)
         await self._reconnect_event.wait()
 
         if not self._is_connected:
@@ -364,35 +456,31 @@ class AgentSession:
                 NetworkError(message="Cannot send message: not connected.")
             )
 
-        async with self._lock:
-            # Ждём завершения текущего незапрошенного сообщения от агента,
-            # чтобы не смешать чужой хвост с нашим ответом.
-            while self._is_incoming_traffic:
-                await asyncio.sleep(0.05)
+        msg_id = str(uuid.uuid4())
+        queue: asyncio.Queue[_QueueItem] = asyncio.Queue()
+        self._response_queues[msg_id] = queue
 
-            # Сбрасываем мусор из предыдущего цикла
-            while not self._response_queue.empty():
-                self._response_queue.get_nowait()
+        try:
+            payload: dict[str, Any] = {
+                "type": "message",
+                "msg": msg_id,
+                "text": message,
+            }
+            if attachments:
+                payload["attachments"] = attachments
+            await self.send(json.dumps(payload))
 
-            self._waiting_for_response = True
-
-            try:
-                payload = {"type": "message", "text": message}
-                if attachments:
-                    payload["attachments"] = attachments
-                await self.send(json.dumps(payload))
-
-                while True:
-                    item = await self._response_queue.get()
-                    match item:
-                        case str():
-                            yield item
-                        case _End():
-                            break
-                        case _Error(error):
-                            raise SletClientError(error)
-            finally:
-                self._waiting_for_response = False
+            while True:
+                item = await queue.get()
+                match item:
+                    case TextDelta() | ThinkingDelta():
+                        yield item
+                    case _End():
+                        break
+                    case _Error(error):
+                        raise SletClientError(error)
+        finally:
+            self._response_queues.pop(msg_id, None)
 
     async def chat(
         self,
@@ -400,48 +488,76 @@ class AgentSession:
         files: list[Any] | None = None,
     ) -> str:
         """
-        Отправляет сообщение и возвращает полный текстовый ответ агента.
+        Sends a message and returns the agent's full text response
+        (no thinking — only ``TextDelta``).
 
-        Удобная обёртка над ``stream()``, собирающая чанки в единую строку.
+        A convenience wrapper over ``stream()`` that collects text chunks
+        into a single string. Use ``chat_with_thinking()`` if you also
+        need the model's thinking text.
 
         Parameters
         ----------
         message:
-            Текст сообщения пользователя.
+            The user's message text.
         files:
-            Список файлов для прикрепления.
+            A list of files to attach.
 
         Returns
         -------
         str
-            Полный ответ агента.
+            The agent's full text response.
         """
         chunks: list[str] = []
-        async for chunk in self.stream(message=message, files=files):
-            chunks.append(chunk)
+        async for item in self.stream(message=message, files=files):
+            if isinstance(item, TextDelta):
+                chunks.append(item.text)
         return "".join(chunks)
+
+    async def chat_with_thinking(
+        self,
+        message: str,
+        files: list[Any] | None = None,
+    ) -> tuple[str, str]:
+        """
+        Like ``chat()``, but additionally returns the accumulated
+        model thinking text.
+
+        Returns
+        -------
+        tuple[str, str]
+            (response text, thinking text). The second element is an
+            empty string if the provider/agent did not supply thinking.
+        """
+        text_chunks: list[str] = []
+        thinking_chunks: list[str] = []
+        async for item in self.stream(message=message, files=files):
+            if isinstance(item, TextDelta):
+                text_chunks.append(item.text)
+            else:
+                thinking_chunks.append(item.text)
+        return "".join(text_chunks), "".join(thinking_chunks)
 
     async def upload_file(self, file: Any) -> dict:
         """
-        Загружает файл на сервер через HTTP.
+        Uploads a file to the server over HTTP.
 
         Parameters
         ----------
         file:
-            - ``str``       — текстовое содержимое (text/plain, UTF-8).
-            - ``bytes``     — сырые байты (application/octet-stream).
-            - file-like     — объект с методом ``.read()``
-              (``BufferedReader``, ``SpooledTemporaryFile`` и т.д.).
+            - ``str``       — text content (text/plain, UTF-8).
+            - ``bytes``     — raw bytes (application/octet-stream).
+            - file-like     — an object with a ``.read()`` method
+              (``BufferedReader``, ``SpooledTemporaryFile``, etc.).
 
         Returns
         -------
         dict
-            Ответ сервера, содержащий как минимум ``file_id``.
+            The server response, containing at least ``file_id``.
 
         Raises
         ------
         TypeError
-            Если тип аргумента не поддерживается.
+            If the argument type is not supported.
         """
         if isinstance(file, str):
             file_data = file.encode("utf-8")
@@ -477,47 +593,63 @@ class AgentSession:
             data={"mime_type": mime_type},
         )
 
-    async def trigger(self, name: str, payload: dict[str, Any] | None = None) -> None:
+    async def trigger(
+        self,
+        name: str,
+        payload: dict[str, Any] | None = None,
+    ) -> str:
         """
-        Отправляет триггер (событие) агенту без ожидания ответа.
+        Sends a trigger (event) to the agent without waiting for a response.
 
-        Для получения реакции агента используйте колбэки
-        ``on_message`` или ``on_incoming_stream``.
+        The response to the trigger (and its errors) is broadcast to all
+        devices of the session, including the initiator — use the
+        ``on_message`` / ``on_incoming_stream`` / ``on_server_error``
+        callbacks to receive it. The returned ``msg_id`` can be used to
+        match it with these callbacks (they receive ``msg_id`` as the
+        first argument).
 
         Parameters
         ----------
         name:
-            Имя триггера.
+            The trigger name.
         payload:
-            Произвольные данные события.
+            Arbitrary event data.
+
+        Returns
+        -------
+        str
+            The generated message identifier (``msg``) — for later
+            matching with unsolicited events.
 
         Raises
         ------
         ConnectionError
-            Если WebSocket не подключён.
+            If the WebSocket is not connected.
         """
         if not self._is_connected:
             raise ConnectionError("Not connected.")
 
-        event = {"type": "trigger", "name": name, "payload": payload or {}}
+        msg_id = str(uuid.uuid4())
+        event = {"type": "trigger", "msg": msg_id, "name": name, "payload": payload or {}}
         await self.send(json.dumps(event))
+        return msg_id
 
     async def set_stream_mode(self, stream_mode: StreamMode) -> None:
         """
-        Меняет режим стриминга сообщений от агента.
+        Changes the streaming mode of messages from the agent.
 
-        Не влияет на уже запущенные запросы к агенту,
-        вступает в силу на следующем запросе.
+        Does not affect requests already in progress,
+        takes effect on the next request.
 
         Parameters
         ----------
         stream_mode:
-            Режим стриминга сообщений.
+            The message streaming mode.
 
         Raises
         ------
         ConnectionError
-            Если WebSocket не подключён.
+            If the WebSocket is not connected.
         """
         if not self._is_connected:
             raise ConnectionError("Not connected.")
@@ -526,7 +658,7 @@ class AgentSession:
         await self.send(json.dumps(event))
 
     # ------------------------------------------------------------------
-    # Вспомогательные приватные методы
+    # Helper private methods
     # ------------------------------------------------------------------
 
     async def _connect_websocket(self) -> None:
@@ -540,41 +672,49 @@ class AgentSession:
 
     def _add_callbacks_attributes(self) -> None:
         """
-        Добавляет атрибуты для коллбэков.
-        Коллбэки поддерживают как async, так и sync функции.
+        Adds attributes for callbacks.
+        Callbacks support both async and sync functions.
         """
 
-        # Вызывается при получении полного незапрошенного сообщения.
-        # (stream_unsolicited=False)
-        self.on_message: (Callable[[str], None | Awaitable[None]]) | None = None
-
-        # Вызывается при начале незапрошенного потока.
-        # (stream_unsolicited=True)
-        self.on_incoming_stream: (
-            Callable[[AsyncIterable[str]], None | Awaitable[None]]
+        # Called when a full unsolicited message is received.
+        # (stream_unsolicited=False). Signature: (text, thinking, msg_id).
+        # thinking — an empty string if there was no thinking.
+        self.on_message: (
+            Callable[[str, str, str], None | Awaitable[None]]
         ) | None = None
 
-        # Уведомление о старте инструмента на стороне сервера.
-        self.on_tool_start: (Callable[[str], None | Awaitable[None]]) | None = None
+        # Called when a new unsolicited stream starts.
+        # (stream_unsolicited=True). Signature: (msg_id, generator).
+        self.on_incoming_stream: (
+            Callable[[str, AsyncIterable[StreamItem]], None | Awaitable[None]]
+        ) | None = None
 
-        # Глобальный обработчик исключений.
+        # Notification that a tool has started on the server side.
+        # Signature: (tool_name, msg_id).
+        self.on_tool_start: (
+            Callable[[str, str], None | Awaitable[None]]
+        ) | None = None
+
+        # Global exception handler.
         self.on_error: (Callable[[Exception], None | Awaitable[None]]) | None = None
 
-        # Глобальный обработчик сообщений об ошибках от сервера.
+        # Global handler for error messages from the server.
+        # Signature: (error, msg_id). msg_id may be None if the error
+        # is not tied to a specific message.
         self.on_server_error: (
-            Callable[[ErrorResponse], None | Awaitable[None]]
+            Callable[[ErrorResponse, str | None], None | Awaitable[None]]
         ) | None = None
 
-        # Уведомление о смене модели / провайдера.
-        self.on_model_change: (Callable[[str, str], None | Awaitable[None]]) | None = (
-            None
-        )
+        # Notification of a model/provider change.
+        self.on_model_change: (
+            Callable[[str, str, str], None | Awaitable[None]]
+        ) | None = None
 
     async def _cancel_listener(self) -> None:
         """
-        Отменяет фоновый listener и дожидается его завершения.
+        Cancels the background listener and waits for it to finish.
 
-        Безопасен для вызова, даже если listener уже завершён или не запускался.
+        Safe to call even if the listener has already finished or never started.
         """
         if self._listener_task and not self._listener_task.done():
             self._listener_task.cancel()
@@ -586,80 +726,64 @@ class AgentSession:
 
     async def _restart_listener(self) -> None:
         """
-        Гарантированно останавливает старый listener и запускает новый.
+        Guarantees the old listener is stopped and a new one is started.
 
-        Вызывается после успешного реконнекта, чтобы исключить ситуацию,
-        когда два listener одновременно читают один и тот же сокет.
+        Called after a successful reconnect to prevent a situation where
+        two listeners simultaneously read from the same socket.
         """
         await self._cancel_listener()
         self._listener_task = asyncio.create_task(self._listen_loop())
 
     def _cleanup_queues(self) -> None:
         """
-        Разблокирует всех ожидающих при разрыве соединения и очищает буфера.
+        Unblocks everyone waiting on connection loss and clears the buffers.
 
-        Должна вызываться из ``_listen_loop`` перед попыткой реконнекта.
+        Should be called from ``_listen_loop`` before attempting a reconnect.
+        Each active ``stream()``/``chat()`` receives an ``_End`` in its own
+        queue (it removes its own entry in ``finally``); all active
+        unsolicited streams are also terminated.
         """
-        # Сбрасываем флаг явно, чтобы исключить гонку между _cleanup_queues
-        # и finally-блоком stream(): если новые токены придут после реконнекта
-        # до выхода из stream(), они не попадут в «старую» очередь.
-        self._waiting_for_response = False
-        self._is_incoming_traffic = False
+        for queue in self._response_queues.values():
+            queue.put_nowait(_End())
 
-        # Разблокируем stream(), если он висит на get()
-        self._response_queue.put_nowait(_End())
-
-        # Завершаем незапрошенный стрим, если был активен
-        if self._unsolicited_stream_queue:
-            self._unsolicited_stream_queue.put_nowait(_End())
-            self._unsolicited_stream_queue = None
-
-        self._unsolicited_buffer.clear()
+        for queue in self._unsolicited_streams.values():
+            queue.put_nowait(_End())
+        self._unsolicited_streams.clear()
+        self._unsolicited_buffers.clear()
 
     # ------------------------------------------------------------------
-    # Фоновый цикл чтения WebSocket
+    # Background WebSocket read loop
     # ------------------------------------------------------------------
 
     async def _listen_loop(self) -> None:
         """
-        Постоянно читает WebSocket и маршрутизирует входящие данные.
+        Continuously reads the WebSocket and routes incoming data.
 
-        Маршрутизация
-        -------------
-        - Системные события (JSON с полем ``type``) → соответствующие обработчики.
-        - Текстовые токены во время активного chat/stream → ``_response_queue``.
-        - Текстовые токены при инициативе агента → буфер или
-          ``_unsolicited_stream_queue`` (зависит от ``stream_unsolicited``).
+        All protocol messages are JSON with a ``type`` field. Routing is
+        done by event type and by the ``msg`` field (if present): if
+        ``msg`` matches an active ``stream()``/``chat()`` — it goes to its
+        queue, otherwise it's handled as unsolicited (broadcast from a
+        trigger, including one launched by another device).
 
-        При разрыве соединения запускает ``_reconnect_loop``,
-        если ``disconnect()`` не был вызван вручную.
+        On connection loss, starts ``_reconnect_loop``,
+        unless ``disconnect()`` was called manually.
         """
         self.logger.debug("Background listener started.")
         try:
             async for raw_msg in self.websocket:
-                is_system_msg = False
+                try:
+                    data = json.loads(raw_msg)
+                except json.JSONDecodeError:
+                    self.logger.warning(
+                        f"Received a message that is not valid JSON: {raw_msg!r}"
+                    )
+                    continue
 
-                # Оптимизация: парсим JSON только если сообщение похоже на объект
-                if raw_msg.startswith("{"):
-                    try:
-                        data = json.loads(raw_msg)
-                        if isinstance(data, dict) and "type" in data:
-                            is_system_msg = True
-                            await self._dispatch_event(data)
-                            continue
-                    except json.JSONDecodeError:
-                        # Начинается с '{', но не является JSON — обрабатываем как текст
-                        pass
+                if not isinstance(data, dict) or "type" not in data:
+                    self.logger.warning(f"Received a message of unknown format: {data!r}")
+                    continue
 
-                # --- Текстовый токен ---
-                if not is_system_msg:
-                    if self._waiting_for_response:
-                        # Режим диалога: кладём токен в очередь ответа
-                        await self._response_queue.put(raw_msg)
-                    else:
-                        # Инициатива агента: поднимаем флаг, чтобы chat() не вклинился
-                        self._is_incoming_traffic = True
-                        await self._handle_unsolicited_token(raw_msg)
+                await self._dispatch_event(data)
 
         except ConnectionClosed as e:
             self.logger.warning(f"WebSocket closed: {e}")
@@ -675,100 +799,148 @@ class AgentSession:
 
     async def _dispatch_event(self, data: dict) -> None:
         """
-        Обрабатывает системное WebSocket-событие (JSON с полем ``type``).
+        Handles a single protocol event (JSON with a ``type`` field).
 
         Parameters
         ----------
         data:
-            Распарсенный JSON-объект события.
+            The parsed JSON event object.
         """
         event_type: str = data.get("type", "")
+        msg_id: str | None = data.get("msg")
 
-        # --- Конец ответа ---
-        if event_type == "end_of_answer":
-            self._is_incoming_traffic = False
+        if event_type == "chunk":
+            await self._route_item(msg_id, TextDelta(data.get("chunk", "")))
 
-            if self._waiting_for_response:
-                # Завершаем активный stream()
-                await self._response_queue.put(_End())
-            else:
-                # Конец незапрошенного сообщения
-                if self.stream_unsolicited:
-                    if self._unsolicited_stream_queue:
-                        await self._unsolicited_stream_queue.put(_End())
-                        self._unsolicited_stream_queue = None
-                else:
-                    if self._unsolicited_buffer:
-                        full_text = "".join(self._unsolicited_buffer)
-                        self._unsolicited_buffer.clear()
-                        self._invoke_callback(self.on_message, full_text)
+        elif event_type == "thinking":
+            await self._route_item(msg_id, ThinkingDelta(data.get("chunk", "")))
 
-        # --- Вызов клиентского инструмента ---
+        elif event_type == "response":
+            await self._route_item(msg_id, TextDelta(data.get("payload", "")))
+
+        elif event_type == "thinking_response":
+            await self._route_item(msg_id, ThinkingDelta(data.get("payload", "")))
+
+        elif event_type == "end_of_answer":
+            await self._route_end(msg_id)
+
+        elif event_type == "error":
+            err = ErrorResponse(**data.get("payload", {}))
+            await self._route_error(msg_id, err)
+
         elif event_type == "client_tool_call":
             asyncio.create_task(self._handle_client_tool_call(data.get("payload", {})))
 
-        # --- Уведомление о старте инструмента ---
         elif event_type == "tool_start":
             name: str = data.get("payload", {}).get("name", "")
-            self._invoke_callback(self.on_tool_start, name)
+            self._invoke_callback(self.on_tool_start, name, msg_id)
 
-        # --- Смена модели / провайдера ---
         elif event_type == "model_changed":
             payload = data.get("payload", {})
             self._invoke_callback(
                 self.on_model_change,
                 payload.get("provider"),
                 payload.get("model"),
+                payload.get("source", "server"),
             )
 
-        # --- Ошибка от сервера ---
-        elif event_type == "error":
-            self._is_incoming_traffic = False
+        elif event_type == "stream_mode_changed":
+            pass  # confirmation of mode change, no dedicated callback yet
 
-            # Закрываем незавершённые стримы/буфера
-            if self._unsolicited_stream_queue:
-                await self._unsolicited_stream_queue.put(_End())
-                self._unsolicited_stream_queue = None
-            self._unsolicited_buffer.clear()
+        else:
+            self.logger.debug(f"Unknown event type: {event_type!r}")
 
-            err = ErrorResponse(**data.get("payload", {}))
-
-            if self._waiting_for_response:
-                await self._response_queue.put(_Error(err))
-
-            self._invoke_callback(self.on_server_error, err)
-
-    async def _handle_unsolicited_token(self, token: str) -> None:
+    async def _route_item(self, msg_id: str | None, item: StreamItem) -> None:
         """
-        Маршрутизирует токен незапрошенного сообщения в стрим или буфер.
+        Routes a response chunk (text/thinking) either to the queue of an
+        active stream()/chat(), or to unsolicited handling, depending on
+        whether this ``msg_id`` is registered locally.
+        """
+        queue = self._response_queues.get(msg_id) if msg_id else None
+        if queue is not None:
+            await queue.put(item)
+            return
+
+        await self._handle_unsolicited_item(msg_id, item)
+
+    async def _route_end(self, msg_id: str | None) -> None:
+        """Routes the end-of-response signal to the appropriate queue/buffer."""
+        queue = self._response_queues.get(msg_id) if msg_id else None
+        if queue is not None:
+            await queue.put(_End())
+            return
+
+        if msg_id is None:
+            return
+
+        if self.stream_unsolicited:
+            stream_queue = self._unsolicited_streams.pop(msg_id, None)
+            if stream_queue is not None:
+                await stream_queue.put(_End())
+        else:
+            items = self._unsolicited_buffers.pop(msg_id, [])
+            if items:
+                text = "".join(i.text for i in items if isinstance(i, TextDelta))
+                thinking = "".join(i.text for i in items if isinstance(i, ThinkingDelta))
+                self._invoke_callback(self.on_message, text, thinking, msg_id)
+
+    async def _route_error(self, msg_id: str | None, error: ErrorResponse) -> None:
+        """
+        Routes an error to the appropriate queue/stream (to wake up waiters)
+        and always additionally invokes the global ``on_server_error``.
+        """
+        queue = self._response_queues.get(msg_id) if msg_id else None
+        if queue is not None:
+            await queue.put(_Error(error))
+        elif msg_id is not None:
+            stream_queue = self._unsolicited_streams.pop(msg_id, None)
+            if stream_queue is not None:
+                await stream_queue.put(_Error(error))
+            self._unsolicited_buffers.pop(msg_id, None)
+
+        self._invoke_callback(self.on_server_error, error, msg_id)
+
+    async def _handle_unsolicited_item(self, msg_id: str | None, item: StreamItem) -> None:
+        """
+        Routes a chunk of an unsolicited message into a stream or buffer,
+        separately for each ``msg_id``.
 
         Parameters
         ----------
-        token:
-            Текстовый чанк от агента.
+        msg_id:
+            The message identifier from the server. If the server for some
+            reason did not send a ``msg`` — the event is logged and
+            dropped, since it cannot be correctly grouped with the rest.
+        item:
+            A chunk of text/thinking from the agent.
         """
-        if self.stream_unsolicited:
-            if self._unsolicited_stream_queue is None:
-                # Первый токен новой волны — создаём очередь и уведомляем пользователя
-                self._unsolicited_stream_queue = asyncio.Queue()
-                gen = self._make_unsolicited_generator(self._unsolicited_stream_queue)
-                self._invoke_callback(self.on_incoming_stream, gen)
+        if msg_id is None:
+            self.logger.warning("Unsolicited event without msg — dropped.")
+            return
 
-            await self._unsolicited_stream_queue.put(token)
+        if self.stream_unsolicited:
+            queue = self._unsolicited_streams.get(msg_id)
+            if queue is None:
+                queue = asyncio.Queue()
+                self._unsolicited_streams[msg_id] = queue
+                gen = self._make_unsolicited_generator(queue)
+                self._invoke_callback(self.on_incoming_stream, msg_id, gen)
+
+            await queue.put(item)
         else:
-            self._unsolicited_buffer.append(token)
+            self._unsolicited_buffers.setdefault(msg_id, []).append(item)
 
     async def _on_listener_failure(self, error: NetworkError) -> None:
         """
-        Вызывается при неожиданном завершении ``_listen_loop``.
+        Called when ``_listen_loop`` terminates unexpectedly.
 
-        Сбрасывает состояние, вызывает ``on_error`` и запускает реконнект,
-        если соединение не было закрыто вручную.
+        Resets state, invokes ``on_error``, and starts reconnecting,
+        unless the connection was closed manually.
 
         Parameters
         ----------
         error:
-            Описание причины сбоя.
+            Description of the failure cause.
         """
         self._is_connected = False
         self._cleanup_queues()
@@ -776,16 +948,17 @@ class AgentSession:
         if not self._manual_disconnect:
             if self.on_error:
                 self._invoke_callback(self.on_error, SletClientError(error))
-            # Запускаем реконнект как отдельную задачу.
-            # Используем add_done_callback, чтобы не потерять исключение молча.
+            # Start the reconnect as a separate task.
+            # Use add_done_callback so the exception is not silently lost.
             task = asyncio.create_task(self._reconnect_loop())
             task.add_done_callback(self._on_reconnect_task_done)
 
     def _on_reconnect_task_done(self, task: asyncio.Task) -> None:
         """
-        Колбэк завершения задачи реконнекта.
+        Callback for the completion of the reconnect task.
 
-        Вытаскивает исключение из задачи, чтобы оно не «проглотилось» молча.
+        Retrieves the exception from the task so it doesn't get
+        silently swallowed.
         """
         if not task.cancelled():
             exc = task.exception()
@@ -793,27 +966,39 @@ class AgentSession:
                 self.logger.error(f"Reconnect loop failed with exception: {exc}")
 
     # ------------------------------------------------------------------
-    # Вспомогательные методы
+    # Helper methods
     # ------------------------------------------------------------------
 
-    def _invoke_callback(self, callback: Callable | None, *args: Any) -> None:
-        """
-        Безопасно вызывает колбэк в текущем event loop.
+    def _serialize_tool_result(self, value: Any) -> str:
+        """Convert an arbitrary client-tool return value into text for the
+        server. Strings pass through untouched; everything else is JSON-encoded
+        where possible (dicts/lists/most dataclasses via ``default=str``), and
+        falls back to ``str()`` only if that's not possible at all."""
+        if isinstance(value, str):
+            return value
+        try:
+            return json.dumps(value, ensure_ascii=False, default=str)
+        except TypeError:
+            return str(value)
 
-        - Async-функции планируются через ``asyncio.create_task()``.
-        - Sync-функции вызываются напрямую.
+    def _invoke_callback(self, callback: Callable[..., Any] | None, *args: Any) -> None:
+        """
+        Safely invokes a callback in the current event loop.
+
+        - Async functions are scheduled via ``asyncio.create_task()``.
+        - Sync functions are called directly.
 
         .. warning::
-            Синхронные колбэки выполняются в потоке event loop.
-            Блокирующие операции в них затормозят ``_listen_loop``.
-            По возможности используйте async-колбэки.
+            Synchronous callbacks run in the event loop thread.
+            Blocking operations in them will stall ``_listen_loop``.
+            Use async callbacks whenever possible.
 
         Parameters
         ----------
         callback:
-            Вызываемый объект или ``None``.
+            The callable or ``None``.
         *args:
-            Аргументы для колбэка.
+            Arguments for the callback.
         """
         if not callback:
             return
@@ -822,8 +1007,9 @@ class AgentSession:
             if inspect.iscoroutinefunction(callback):
                 asyncio.create_task(callback(*args))
             else:
+                name = getattr(callback, "__name__", repr(callback))
                 self.logger.debug(
-                    f"{callback.__name__} is a sync callback. "
+                    f"{name} is a sync callback. "
                     "Make sure it does not perform any blocking operations."
                 )
                 callback(*args)
@@ -831,7 +1017,7 @@ class AgentSession:
         except Exception as e:
             self.logger.error(f"Error invoking callback {callback}: {e}")
 
-            # Избегаем рекурсии: не вызываем on_error из самого on_error
+            # Avoid recursion: don't call on_error from on_error itself
             if self.on_error is not None and callback is not self.on_error:
                 try:
                     cb_error = SletClientError(
@@ -847,27 +1033,28 @@ class AgentSession:
     async def _make_unsolicited_generator(
         self,
         queue: asyncio.Queue[_QueueItem],
-    ) -> AsyncGenerator[str, None]:
+    ) -> AsyncGenerator[StreamItem, None]:
         """
-        Генератор, читающий чанки незапрошенного сообщения из очереди.
+        A generator that reads chunks of an unsolicited message from the queue.
 
-        Завершается при получении ``_End`` или бросает ``SletClientError``
-        при ``_Error``.
+        Terminates upon receiving ``_End`` or raises ``SletClientError``
+        on ``_Error``.
 
         Parameters
         ----------
         queue:
-            Очередь, в которую ``_listen_loop`` кладёт токены.
+            The queue into which ``_dispatch_event`` puts items belonging
+            to a specific ``msg_id``.
 
         Yields
         ------
-        str
-            Текстовые чанки.
+        StreamItem
+            ``TextDelta`` / ``ThinkingDelta``.
         """
         while True:
             item = await queue.get()
             match item:
-                case str():
+                case TextDelta() | ThinkingDelta():
                     yield item
                 case _End():
                     break
@@ -876,15 +1063,15 @@ class AgentSession:
 
     async def _handle_client_tool_call(self, payload: dict) -> None:
         """
-        Обрабатывает вызов клиентского инструмента, инициированный агентом.
+        Handles a client tool call initiated by the agent.
 
-        Ищет зарегистрированный инструмент по имени, вызывает его
-        и отправляет результат обратно на сервер.
+        Looks up the registered tool by name, calls it,
+        and sends the result back to the server.
 
         Parameters
         ----------
         payload:
-            Словарь с полями ``name``, ``args`` и ``tool_call_id``.
+            A dict with the fields ``name``, ``args``, and ``tool_call_id``.
         """
         tool_name: str = payload.get("name", "")
         args: dict = payload.get("args", {})
@@ -901,10 +1088,12 @@ class AgentSession:
         else:
             try:
                 if inspect.iscoroutinefunction(fn):
-                    result = str(await fn(**args))
+                    raw_result = await fn(**args)
                 else:
                     loop = asyncio.get_running_loop()
-                    result = str(await loop.run_in_executor(None, lambda: fn(**args)))
+                    # noinspection PyTypeChecker
+                    raw_result = await loop.run_in_executor(None, lambda: fn(**args))
+                result = self._serialize_tool_result(raw_result)
             except Exception as e:
                 result = f"Error executing tool '{tool_name}': {e}"
                 self.logger.error(result)
@@ -922,26 +1111,26 @@ class AgentSession:
             await self.websocket.send(json.dumps(response))
 
     # ------------------------------------------------------------------
-    # Реконнект
+    # Reconnect
     # ------------------------------------------------------------------
 
     async def _reconnect_loop(self) -> None:
         """
-        Пытается восстановить WebSocket-соединение после разрыва.
+        Attempts to restore the WebSocket connection after a disconnect.
 
-        Выполняет до ``max_reconnect_attempts`` попыток с паузой
-        ``reconnect_delay`` секунд между ними.
+        Performs up to ``max_reconnect_attempts`` attempts with a pause
+        of ``reconnect_delay`` seconds between them.
 
-        При каждой неудаче вызывает ``on_error``.
-        После успешного реконнекта перезапускает ``_listen_loop``.
+        Invokes ``on_error`` on each failure.
+        Restarts ``_listen_loop`` after a successful reconnect.
 
         Raises
         ------
         SletClientError
-            Если все попытки исчерпаны.
+            If all attempts are exhausted.
         """
         self._reconnect_attempt = 0
-        self._reconnect_event.clear()  # блокируем chat/stream на время реконнекта
+        self._reconnect_event.clear()  # block chat/stream/trigger during reconnect
 
         while self._reconnect_attempt < self.max_reconnect_attempts:
             self._reconnect_attempt += 1
@@ -957,14 +1146,14 @@ class AgentSession:
                 self._is_connected = True
                 self._manual_disconnect = False
 
-                # Гарантированно останавливаем старый listener (если вдруг ещё жив)
-                # и запускаем новый. Без этого два listener могли бы одновременно
-                # читать один сокет и перемешивать сообщения.
+                # Guarantee the old listener is stopped (in case it's still alive)
+                # and start a new one. Without this, two listeners could
+                # simultaneously read the same socket and interleave messages.
                 await self._restart_listener()
 
-                self._reconnect_event.set()  # разблокируем chat/stream
+                self._reconnect_event.set()  # unblock chat/stream/trigger
                 self.logger.info("WebSocket successfully reconnected.")
-                return  # ✅ Успех
+                return  # ✅ Success
 
             except Exception as e:
                 message = (
@@ -982,21 +1171,21 @@ class AgentSession:
                     self._invoke_callback(self.on_error, SletClientError(error))
 
                 if is_last:
-                    # Разблокируем ожидающих, чтобы они не зависли навсегда
+                    # Unblock waiters so they don't hang forever
                     self._reconnect_event.set()
                     raise SletClientError(error)
 
                 await asyncio.sleep(self.reconnect_delay)
 
     # ------------------------------------------------------------------
-    # Magic: доступ к подагентам через атрибуты
+    # Magic: attribute-based access to sub-agents
     # ------------------------------------------------------------------
 
     def __getattr__(self, name: str) -> AgentSession:
         """
-        Магический доступ к дочерним подагентам через атрибуты экземпляра.
+        Magic attribute-based access to child sub-agents.
 
-        Пример использования::
+        Example usage::
 
             session.SubAgentId.connect()
             await session.SubAgentId.chat("hello")
@@ -1004,14 +1193,14 @@ class AgentSession:
         Parameters
         ----------
         name:
-            Идентификатор подагента.
+            The sub-agent identifier.
 
         Raises
         ------
         AttributeError
-            Если подагент с таким именем не зарегистрирован.
+            If no sub-agent with this name is registered.
         """
-        # Приватные и dunder-атрибуты пробрасываем стандартно, чтобы избежать рекурсии
+        # Pass through private and dunder attributes normally to avoid recursion
         if name.startswith("_"):
             raise AttributeError(name)
 

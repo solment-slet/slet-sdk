@@ -4,6 +4,10 @@ import httpx
 import json
 import logging
 from typing import Any
+from datetime import date, datetime
+from decimal import Decimal
+from uuid import UUID
+from enum import Enum
 
 from pydantic import BaseModel, ValidationError
 import websockets
@@ -115,6 +119,9 @@ class SletClient:
     ) -> dict | T | None:
         last_resp: httpx.Response | None = None
 
+        if body is not None and "json" in kwargs:
+            raise ValueError("Pass either 'body' or 'json', not both.")
+
         if body is not None:
             if isinstance(body, BaseModel):
                 kwargs["content"] = body.model_dump_json(exclude_none=True)
@@ -123,7 +130,19 @@ class SletClient:
                     "Content-Type": "application/json",
                 }
             else:
-                kwargs["json"] = body
+                kwargs["content"] = json.dumps(body, default=self._json_default).encode("utf-8")
+                kwargs["headers"] = {
+                    **kwargs.get("headers", {}),
+                    "Content-Type": "application/json",
+                }
+
+        elif "json" in kwargs:
+            raw_json = kwargs.pop("json")
+            kwargs["content"] = json.dumps(raw_json, default=self._json_default).encode("utf-8")
+            kwargs["headers"] = {
+                **kwargs.get("headers", {}),
+                "Content-Type": "application/json",
+            }
 
         for attempt in range(2):
             merged_headers = {**kwargs.get("headers", {})}
@@ -175,6 +194,18 @@ class SletClient:
 
         assert last_resp is not None
         raise SletClientError(self._build_error(last_resp))
+
+    @staticmethod
+    def _json_default(obj: Any) -> Any:
+        if isinstance(obj, UUID):
+            return str(obj)
+        if isinstance(obj, (datetime, date)):
+            return obj.isoformat()
+        if isinstance(obj, Decimal):
+            return str(obj)
+        if isinstance(obj, Enum):
+            return obj.value
+        raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
 
     @staticmethod
     def _is_empty_body(method: str, resp: httpx.Response) -> bool:

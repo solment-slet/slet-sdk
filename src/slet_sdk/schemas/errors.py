@@ -241,12 +241,42 @@ class BadGateway(ErrorResponse):
     )
 
 
-class ProviderUnavailableError(ErrorResponse):
+class ProviderConnectionError(ErrorResponse):
     status: int = 502
-    error: str = ErrorCode.PROVIDER_UNAVAILABLE_ERROR
+    error: str = ErrorCode.PROVIDER_CONNECTION_ERROR
     message: str = Field(
-        default="Provider Unavailable",
+        default="Error Connecting to the User Provider",
     )
+
+
+class ProviderTimeoutError(ErrorResponse):
+    status: int = 504
+    error: str = ErrorCode.PROVIDER_TIMEOUT_ERROR
+    message: str = Field(
+        default="Connection Timeout to the User Provider",
+    )
+
+
+class ProviderStatusErrorExtra(BaseModel):
+    upstream_status: int
+    upstream_body: dict
+
+
+class ProviderStatusError(ErrorResponse):
+    status: int = 502
+    error: str = ErrorCode.PROVIDER_STATUS_ERROR
+    message: str = Field(
+        default="Bad Status From the User Provider",
+    )
+    extra: ProviderStatusErrorExtra
+
+    def __init__(self, *, upstream_status: int, upstream_body: dict, **kwargs):
+        kwargs.pop("extra", None)
+        kwargs["extra"] = ProviderStatusErrorExtra(
+            upstream_status=upstream_status,
+            upstream_body=upstream_body,
+        )
+        super().__init__(**kwargs)
 
 
 # ===========================

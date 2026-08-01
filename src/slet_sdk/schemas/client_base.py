@@ -20,4 +20,5 @@ class ErrorResponse(BaseModel):
     status: int
     error: str
     message: str
+    extra: dict[str, Any | None] = Field(default=None, exclude_if=lambda v: v is None)
     trace_id: str | None = None

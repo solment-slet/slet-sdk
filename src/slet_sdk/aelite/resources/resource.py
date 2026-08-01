@@ -1,76 +1,53 @@
 from __future__ import annotations
-from typing import Any, Dict
+
+from uuid import UUID
 
 from slet_sdk.core.mixins import BaseResource
 from slet_sdk.aelite.agent import AgentSession
 from slet_sdk.aelite.manifest import AgentManifest
-from slet_sdk.aelite.schemas.agents import AgentDeployResponse
 from slet_sdk.aelite.typing import StreamMode
+from slet_sdk.aelite.schemas.threads import ThreadInfo, ThreadPermissions, ThreadCreateResponse
+from slet_sdk.aelite.schemas.agents import AgentInfo, AgentInfoWithManifest
+
 
 # Sub Resources for AeliteResource
+from .agents import AgentsResource
 from .threads import ThreadsResource
 from .tts import TTSResource
 
 
 class AeliteResource(BaseResource):
     """
-    Namespace для работы с AElite.
-    Доступен как client.aelite в slet_client
+    Aelite Resource.
     """
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
 
+        self.agents = AgentsResource(*args, **kwargs)
         self.threads = ThreadsResource(*args, **kwargs)
         self.tts = TTSResource(*args, **kwargs)
 
-    async def deploy(
-        self,
-        manifest: AgentManifest | Dict[str, Any],
-        thread_id: str | None = None,
-    ) -> AgentDeployResponse:
-        """
-        Деплой агента по манифесту на сервере.
-        Возвращает thread ID каждого агента и подагента.
-
-        :param manifest: Конфигурация агента
-        :param thread_id: ID треда, если None создается новый
-        """
-        if not isinstance(manifest, dict):
-            manifest = manifest.model_dump()
-
-        if not thread_id:
-            thread = await self.threads.create_thread()
-            thread_id = str(thread.id)
-
-        return await self._request(
-            "POST",
-            f"/agent/{thread_id}",
-            schema=AgentDeployResponse,
-            json=manifest,
-        )
-
     async def connect(
         self,
-        thread_id: str | dict[str, str] | AgentDeployResponse,
-        manifest: AgentManifest | None = None,
+        session_id: UUID | str | dict[str, str] | ThreadInfo,
         *,
         device: str | None = None,
         stream_mode: StreamMode | str = StreamMode.tokens,
         recursion: bool = True,
-        register_tools_from_register: bool = True,
+        manifest: AgentManifest | None = None,
     ) -> AgentSession:
-        """Установить соединение с агентом и вернуть сессию.
+        """Установить соединение с сессией.
 
         Строит дерево сессий для root-агента и, опционально, всех его подагентов.
         Если манифест не передан — загружается с сервера автоматически.
 
         Args:
-            thread_id: Идентификатор треда. Принимается в трёх форматах:
+            session_id: Идентификатор треда. Принимается в трёх форматах:
                 - ``str`` — ID root-агента; словарь thread_id для подагентов
                   будет собран автоматически на основе манифеста.
                 - ``dict[str, str]`` — готовый словарь вида ``{agent_name: thread_id}``.
-                - ``AgentDeployResponse`` — объект ответа деплоя; словарь
+                - ``ThreadInfo`` — объект ответа деплоя; словарь
                   извлекается из поля ``agent_ids``.
             manifest: Манифест, использованный при деплое агента.
                 Если не передан, запрашивается у сервера по ``thread_id``.
@@ -80,9 +57,6 @@ class AeliteResource(BaseResource):
             stream_mode: Способ стриминга ответов агента.
             recursion: Если ``True`` (по умолчанию), подключаются root-агент
                 и все подагенты. Если ``False`` — только root-агент.
-            register_tools_from_register: Если ``True`` (по умолчанию),
-                инструменты из глобального реестра (задекорированные ``@tool``)
-                регистрируются в сессии автоматически.
 
         Returns:
             Сессия ``AgentSession`` для взаимодействия с агентом.
@@ -90,42 +64,28 @@ class AeliteResource(BaseResource):
 
         Raises:
             TypeError: Если ``thread_id`` передан в неподдерживаемом типе
-                (не ``str``, ``dict`` или ``AgentDeployResponse``).
-
-        Example:
-            .. code-block:: python
-
-                # Подключение по строковому ID (манифест загрузится автоматически)
-                session = await client.connect("thread-abc123")
-
-                # Подключение с готовым словарём и без рекурсии
-                session = await client.connect(
-                    {"root": "thread-abc123", "sub": "thread-xyz456"},
-                    recursion=False,
-                )
-
-                # Подключение из ответа деплоя
-                deploy = await client.deploy(...)
-                session = await client.connect(deploy)
+                (не ``str``, ``dict`` или ``ThreadInfo``).
         """
 
         if manifest is None:
-            manifest = await self._request(
-                "GET",
-                f"/agent/{thread_id}",
-                schema=AgentManifest,
+            thread = await self.threads.get_thread(
+                UUID(session_id) if not isinstance(session_id, UUID) else session_id,
             )
+            manifest = thread.manifest
 
-        if isinstance(thread_id, AgentDeployResponse):
-            id_map = thread_id.agent_ids
-        elif isinstance(thread_id, dict):
-            id_map = thread_id
-        elif isinstance(thread_id, str):
-            id_map = self._collect_thread_ids(manifest, thread_id)
+        if isinstance(session_id, ThreadCreateResponse):
+            id_map = session_id.session_ids
+        elif isinstance(session_id, ThreadInfo):
+            id_map = self._collect_thread_ids(manifest, str(session_id.id))
+        elif isinstance(session_id, dict):
+            id_map = session_id
+        elif isinstance(session_id, str):
+            id_map = self._collect_thread_ids(manifest, session_id)
+        elif isinstance(session_id, UUID):
+            id_map = self._collect_thread_ids(manifest, str(session_id))
         else:
-            raise TypeError("thread_id must be str, dict or AgentDeployResponse")
+            raise TypeError("session_id must be str, dict or ThreadInfo")
 
-        # Строим дерево сессий
         root = await self._build_session_tree(
             manifest,
             id_map,
@@ -133,39 +93,104 @@ class AeliteResource(BaseResource):
             device=device,
             stream_mode=stream_mode,
         )
-        if register_tools_from_register:
-            root.register_tools_from_registry()
 
         return root
 
-    async def deploy_and_connect(
+    async def get_session_from_manifest(
         self,
         manifest: AgentManifest,
         *,
-        thread_id: str | None = None,
+        # Thread
+        title: str | None = None,
+        permissions: ThreadPermissions | None = None,
+        # Session
         device: str | None = None,
         stream_mode: StreamMode | str = StreamMode.tokens,
         recursion: bool = True,
-        register_tools_from_register: bool = True,
     ) -> AgentSession:
-        """
-        Deploy + connect в одну операцию.
-        """
-        response = await self.deploy(manifest, thread_id=thread_id)
+        # Create agent
+        agent = await self.agents.create_agent(manifest)
 
-        return await self.connect(
-            response.agent_ids,
-            manifest,
+        # Return session from agent
+        return await self.get_session_from_agent(
+            agent,
+            title=title,
+            permissions=permissions,
             device=device,
             stream_mode=stream_mode,
             recursion=recursion,
-            register_tools_from_register=register_tools_from_register,
+            manifest=manifest,
+        )
+
+
+    async def get_session_from_agent(
+        self,
+        agent: UUID | AgentInfo,
+        *,
+        # Thread
+        title: str | None = None,
+        permissions: ThreadPermissions | None = None,
+        # Session
+        device: str | None = None,
+        stream_mode: StreamMode | str = StreamMode.tokens,
+        recursion: bool = True,
+        manifest: AgentManifest | None = None,
+    ) -> AgentSession:
+        if isinstance(agent, UUID):
+            agent_id = agent
+        elif isinstance(agent, AgentInfo):
+            agent_id = agent.id
+        else:
+            raise TypeError(f"Agent must be an instance of UUID or AgentInfo, got {type(agent).__name__}")
+
+        # Create thread
+        thread = await self.threads.create_thread(
+            agent=agent_id,
+            title=title,
+            permissions=permissions,
+        )
+
+        if manifest is None and isinstance(agent, AgentInfoWithManifest):
+            manifest = agent.manifest
+
+        # Return session from thread
+        return await self.get_session_from_thread(
+            thread,
+            device=device,
+            stream_mode=stream_mode,
+            recursion=recursion,
+            manifest=manifest,
+        )
+
+    async def get_session_from_thread(
+        self,
+        thread: UUID | ThreadInfo,
+        *,
+        # Session
+        device: str | None = None,
+        stream_mode: StreamMode | str = StreamMode.tokens,
+        recursion: bool = True,
+        manifest: AgentManifest | None = None,
+    ) -> AgentSession:
+        if isinstance(thread, ThreadInfo):
+            thread_id = thread.id
+        elif isinstance(thread, UUID):
+            thread_id = thread
+        else:
+            raise TypeError(f"Thread must be an instance of UUID or ThreadInfo, got {type(thread).__name__}")
+
+        return await self.connect(
+            thread_id,
+            device=device,
+            stream_mode=stream_mode,
+            recursion=recursion,
+            manifest=manifest,
         )
 
     async def _build_session_tree(
         self,
         manifest: AgentManifest,
-        thread_id_map: dict[str, str],
+        session_id_map: dict[str, str],
         *,
         recursion: bool = True,
         device: str | None = None,
@@ -178,11 +203,11 @@ class AeliteResource(BaseResource):
         if self._access_token:
             headers["Authorization"] = f"Bearer {self._access_token}"
 
-        tid = thread_id_map.get(manifest.id)
+        tid = session_id_map.get(manifest.id)
         if not tid:
             raise ValueError(
-                f"No thread_id found for agent '{manifest.id}'. "
-                f"Available: {list(thread_id_map.keys())}"
+                f"No session_id found for agent '{manifest.id}'. "
+                f"Available: {list(session_id_map.keys())}"
             )
 
         session = AgentSession(
@@ -200,7 +225,7 @@ class AeliteResource(BaseResource):
             for sub_manifest in manifest.sub_agents:
                 sub_session = await self._build_session_tree(
                     sub_manifest,
-                    thread_id_map,
+                    session_id_map,
                     device=device,
                     stream_mode=stream_mode,
                 )
