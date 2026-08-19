@@ -6,7 +6,7 @@ async def get_reasoning_works(client, model) -> bool:
     """Helper."""
     manifest = AgentManifest(
         id="Test_Agent",
-        model=model,
+        models=model,
     )
 
     session = await client.aelite.get_session_from_manifest(manifest)
@@ -39,23 +39,23 @@ async def get_reasoning_works(client, model) -> bool:
     return reasoning_works
 
 
-async def test_reasoning_enabled(client, model):
-    for m in model:
+async def test_reasoning_enabled(client, models):
+    for m in models:
         m.is_reasoning_model = True
         m.thinking_enabled = True
         m.reasoning_effort = "high"
 
-    reasoning_works = await get_reasoning_works(client, model)
+    reasoning_works = await get_reasoning_works(client, models)
 
     assert reasoning_works == True
 
 
-async def test_reasoning_disabled(client, model):
-    for m in model:
+async def test_reasoning_disabled(client, models):
+    for m in models:
         m.is_reasoning_model = False
         m.thinking_enabled = False
         m.reasoning_effort = None
 
-    reasoning_works = await get_reasoning_works(client, model)
+    reasoning_works = await get_reasoning_works(client, models)
 
     assert reasoning_works == False

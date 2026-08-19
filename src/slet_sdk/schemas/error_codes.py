@@ -9,6 +9,9 @@ class ErrorCode(StrEnum):
     UNKNOWN_ERROR = "unknown_error"
 
     # 4xx
+    ## 400
+    BAD_REQUEST = "bad_request"
+
     ## 401
     UNAUTHORIZED = "unauthorized"  # base
     INVALID_CREDENTIALS = "invalid_credentials"

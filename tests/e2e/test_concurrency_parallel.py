@@ -11,12 +11,17 @@ async def send_message(session, message, number):
     return number, result
 
 
-async def test_concurrency_parallel(client, model):
+async def test_concurrency_parallel(client, models):
     manifest = AgentManifest(
         id="Test_Agent",
-        model=model,
+        models=models,
+        system_prompt=(
+            "You are a helpful assistant. When asked to tell a story, "
+            "make one up immediately without asking clarifying questions "
+            "about theme, characters, or length."
+        ),
         memory=MemoryConfig(
-            enabled=True,
+            checkpointing=True,
             summarization="disabled",
             threshold=7,
             keep_last=4,
@@ -47,3 +52,9 @@ async def test_concurrency_parallel(client, model):
 
     data = [msg.model_dump(mode="json") for msg in chat_history]
     print(json.dumps(data, indent=4, ensure_ascii=False))
+
+    human_count = sum(1 for m in chat_history if getattr(m, "role", None) == "user")
+    ai_count = sum(1 for m in chat_history if getattr(m, "role", None) == "ai")
+
+    assert human_count == 3, f"Expected 3 human messages, got {human_count}"
+    assert ai_count == 3, f"Expected 3 ai messages, got {ai_count}"

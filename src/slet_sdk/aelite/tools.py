@@ -1,5 +1,5 @@
 """
-tools.py — client-side tool declarations.
+tools.py - client-side tool declarations.
 
 A "client tool" is a Python callable that the *server* can ask the client
 to execute. Declaring one only attaches metadata to the function (name,
@@ -9,7 +9,7 @@ it anywhere global.
 Two ways to declare tools
 --------------------------
 
-1. Stand-alone ``@tool`` — attaches metadata only. You are responsible
+1. Stand-alone ``@tool`` - attaches metadata only. You are responsible
    for handing the function to both the manifest's ``tools=[...]`` list
    *and* ``session.register_tools([...])``::
 
@@ -21,7 +21,7 @@ Two ways to declare tools
        manifest = AgentManifest(..., tools=[get_clipboard])
        session.register_tools([get_clipboard])
 
-2. ``ToolBelt`` — an explicit, non-global registry. Recommended for
+2. ``ToolBelt`` - an explicit, non-global registry. Recommended for
    anything more than one or two tools, since it removes the duplication
    above and the risk of forgetting to register a tool on the session::
 
@@ -42,14 +42,17 @@ Two ways to declare tools
 
 There is intentionally no process-wide registry. Two unrelated
 ``ToolBelt`` instances (or a bare ``@tool`` function) never collide just
-because they happen to share a tool name — a collision is only possible
+because they happen to share a tool name - a collision is only possible
 *within* the same belt, where it's caught immediately at decoration time.
 """
 
 from __future__ import annotations
 
 import inspect
-from typing import Annotated, Any, Callable, Iterator, get_args, get_origin, get_type_hints
+from typing import Annotated, Any, Callable, Iterator, TYPE_CHECKING, get_args, get_origin, get_type_hints
+
+if TYPE_CHECKING:
+    from slet_sdk.aelite.manifest import BroadcastConfig
 
 # ---------------------------------------------------------------------------
 # Supported parameter types
@@ -61,11 +64,6 @@ _TYPE_TO_STR: dict[type, str] = {
     float: "float",
     bool: "bool",
 }
-
-# Extra ToolConfig fields a tool author may set via decorator kwargs
-# (name/type/description/params are derived automatically and can't be
-# overridden this way).
-_ALLOWED_EXTRA_KEYS = {"timeout", "broadcast"}
 
 
 def _split_annotated(annotation: Any) -> tuple[Any, str | None]:
@@ -90,13 +88,6 @@ def _build_tool_metadata(
         raise ValueError(
             f"Tool '{tool_name}' has no description. Provide one via "
             f"@tool(description=...) or a docstring."
-        )
-
-    unknown_extra = set(extra) - _ALLOWED_EXTRA_KEYS
-    if unknown_extra:
-        raise TypeError(
-            f"Tool '{tool_name}' received unsupported keyword argument(s) "
-            f"{sorted(unknown_extra)}. Supported: {sorted(_ALLOWED_EXTRA_KEYS)}."
         )
 
     sig = inspect.signature(fn)
@@ -146,17 +137,27 @@ def _attach_metadata(fn: Callable[..., Any], metadata: dict[str, Any]) -> Callab
 # ---------------------------------------------------------------------------
 
 
-def tool(_fn: Callable[..., Any] = None, *, name: str = None, description: str = None, **extra):
+def tool(
+    _fn: Callable[..., Any] = None,
+    *,
+    name: str = None,
+    description: str = None,
+    timeout: float | None = None,
+    broadcast: BroadcastConfig | None = None,
+):
     """
     Attach client-tool metadata to a function without registering it
     anywhere. Usable as ``@tool``, ``@tool()``, or
-    ``@tool(name=..., description=..., timeout=30)``.
-
-    Prefer ``ToolBelt`` unless you specifically want to manage
-    registration yourself.
+    ``@tool(name=..., description=..., timeout=..., broaadcast=...)``.
     """
 
     def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
+        extra: dict[str, Any] = {}
+        if timeout is not None:
+            extra["timeout"] = timeout
+        if broadcast is not None:
+            extra["broadcast"] = broadcast
+
         metadata = _build_tool_metadata(fn, name, description, extra)
         return _attach_metadata(fn, metadata)
 
@@ -166,7 +167,7 @@ def tool(_fn: Callable[..., Any] = None, *, name: str = None, description: str =
 
 
 # ---------------------------------------------------------------------------
-# ToolBelt — explicit, non-global tool registry
+# ToolBelt - explicit, non-global tool registry
 # ---------------------------------------------------------------------------
 
 
@@ -191,13 +192,20 @@ class ToolBelt:
         *,
         name: str = None,
         description: str = None,
-        **extra,
+        timeout: float | None = None,
+        broadcast: BroadcastConfig | None = None,
     ):
         """Same usage as the module-level ``tool`` decorator, but registers
         the function on this belt. Raises if the name is already taken on
         this belt."""
 
         def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
+            extra: dict[str, Any] = {}
+            if timeout is not None:
+                extra["timeout"] = timeout
+            if broadcast is not None:
+                extra["broadcast"] = broadcast
+
             metadata = _build_tool_metadata(fn, name, description, extra)
             tool_name = metadata["_tool_name"]
             if tool_name in self._tools:

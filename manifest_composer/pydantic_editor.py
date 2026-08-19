@@ -1,5 +1,5 @@
 """
-pydantic_editor.py — windowed Pydantic model editor.
+pydantic_editor.py - windowed Pydantic models editor.
 Usage: from pydantic_editor import up_server; up_server(MyModel, agent_manifest_mode=True)
 Requires: pip install fastapi uvicorn pydantic
 """
@@ -377,7 +377,7 @@ body{background:var(--bg);color:var(--tx);font-family:var(--sans);font-size:13px
     <div id="desktop">
       <svg id="wires-svg"></svg>
       <div id="desktop-hint">
-        &#x2190; Click &#x2197; or drag any model section here<br>
+        &#x2190; Click &#x2197; or drag any models section here<br>
         <span style="font-size:10px;color:var(--tx3)">Connections between related models will appear as wires</span>
       </div>
     </div>
@@ -459,7 +459,7 @@ var MODEL_NAME = __MODEL_NAME__;
 var MODEL_LOWER = __MODEL_LOWER__;
 var AGENT_MANIFEST_MODE = __AGENT_MANIFEST_MODE__;
 
-// If the root model is self-referential
+// If the root models is self-referential
 var ROOT_SCHEMA = SCHEMA;
 if (SCHEMA && SCHEMA['$ref']) {
   var __rootDefName = SCHEMA['$ref'].replace('#/$defs/', '');
@@ -467,7 +467,7 @@ if (SCHEMA && SCHEMA['$ref']) {
 }
 
 document.getElementById('tb-badge').textContent = MODEL_NAME + (AGENT_MANIFEST_MODE ? ' · Agent mode' : '');
-document.title = MODEL_NAME + ' — Pydantic Editor';
+document.title = MODEL_NAME + ' - Pydantic Editor';
 
 var DESC_MODE = 'none';
 var INST = {};
@@ -666,8 +666,8 @@ function mkId() { return 'i' + (++IC); }
 
 function newInst(modelName, parentId, parentField, parentIndex) {
   var id = mkId();
-  var model = resolveSchema(modelName);
-  var props = model.properties || {};
+  var models = resolveSchema(modelName);
+  var props = models.properties || {};
   var data = {};
   for (var fn in props) {
     var fs = props[fn];
@@ -714,8 +714,8 @@ function newInst(modelName, parentId, parentField, parentIndex) {
 
 function spawnChildren(id) {
   var inst = INST[id];
-  var model = resolveSchema(inst.modelName);
-  var props = model.properties || {};
+  var models = resolveSchema(inst.modelName);
+  var props = models.properties || {};
   for (var fn in props) {
     var fs = props[fn];
     var dr = getDirectRef(fs);
@@ -746,8 +746,8 @@ function spawnChildren(id) {
 function ensureChildrenSpawned(id) {
   var inst = INST[id];
   if (!inst) return;
-  var model = resolveSchema(inst.modelName);
-  var props = model.properties || {};
+  var models = resolveSchema(inst.modelName);
+  var props = models.properties || {};
   for (var fn in props) {
     var fs = props[fn];
     var dr = getDirectRef(fs);
@@ -860,8 +860,8 @@ function deleteInstTree(id) {
 function instDisplayName(id) {
   var inst = INST[id];
   if(!inst) return '?';
-  var model = resolveSchema(inst.modelName);
-  var base = inst.modelName === '__root__' ? (model.title || MODEL_NAME) : (model.title || inst.modelName);
+  var models = resolveSchema(inst.modelName);
+  var base = inst.modelName === '__root__' ? (models.title || MODEL_NAME) : (models.title || inst.modelName);
   if (inst.dictKey !== undefined) return base + (inst.dictKey ? ' ["' + inst.dictKey + '"]' : ' [?]');
   return inst.parentIndex !== null ? base + ' #' + (inst.parentIndex + 1) : base;
 }
@@ -901,8 +901,8 @@ function instanceOrder() {
 function assemble(id) {
   var inst = INST[id];
   if (!inst) return null;
-  var model = resolveSchema(inst.modelName);
-  var props = model.properties || {};
+  var models = resolveSchema(inst.modelName);
+  var props = models.properties || {};
   var result = {};
 
   for (var fn in props) {
@@ -1353,7 +1353,7 @@ function makeOptPrimControl(instId, fn, fs) {
     ctl = makeMlInput(
       function(){ return inst.data[fn]; },
       function(v){ inst.data[fn] = v; },
-      '—', fn
+      '-', fn
     );
     ctl.style.flex = '1'; ctl.style.minWidth = '0';
     inp = ctl.querySelector('input');
@@ -1362,7 +1362,7 @@ function makeOptPrimControl(instId, fn, fs) {
     inp = document.createElement('input');
     inp.type = 'number'; inp.className = 'fi';
     if (inst.data[fn] !== undefined && inst.data[fn] !== null) inp.value = inst.data[fn];
-    inp.placeholder = '—';
+    inp.placeholder = '-';
     inp.oninput = function(){ inst.data[fn] = inp.value; liveUpdate(); };
     ctl = inp;
   }
@@ -1393,7 +1393,7 @@ function makeNumInput(instId, fn, fs, isReq) {
   if (fs.maximum !== undefined) inp.max = fs.maximum;
   var v = INST[instId].data[fn];
   if (v !== undefined) inp.value = v;
-  inp.placeholder = isReq ? 'required' : '—';
+  inp.placeholder = isReq ? 'required' : '-';
   inp.oninput = function(){ INST[instId].data[fn] = inp.value; liveUpdate(); };
   return inp;
 }
@@ -1403,7 +1403,7 @@ function makeTextInput(instId, fn, fs, isReq) {
   return makeMlInput(
     function(){ return inst.data[fn]; },
     function(v){ inst.data[fn] = v; },
-    isReq ? 'required' : '—',
+    isReq ? 'required' : '-',
     fn,
     function(){
       if (isAgentModel(inst.modelName) && fn === 'id'){ renderAgentTabs(); }
@@ -1891,9 +1891,9 @@ function setAllSections(open) {
 
 function buildInstSection(id) {
   var inst = INST[id];
-  var model = resolveSchema(inst.modelName);
-  var props = model.properties || {};
-  var required = model.required || [];
+  var models = resolveSchema(inst.modelName);
+  var props = models.properties || {};
+  var required = models.required || [];
   var displayName = instDisplayName(id);
   var count = Object.keys(props).length;
 
@@ -1950,20 +1950,20 @@ function buildInstSection(id) {
 
   sec.appendChild(hdr);
 
-  if (model.description && DESC_MODE === 'collapsed') {
+  if (models.description && DESC_MODE === 'collapsed') {
     var dcol = document.createElement('div');
     dcol.className = 'm-desc-collapsed';
-    dcol.textContent = model.description;
+    dcol.textContent = models.description;
     sec.appendChild(dcol);
   }
 
   var body = document.createElement('div');
   body.className = 'm-sec-body';
 
-  if (model.description && DESC_MODE === 'expanded') {
+  if (models.description && DESC_MODE === 'expanded') {
     var dexp = document.createElement('div');
     dexp.className = 'm-desc-expanded';
-    dexp.textContent = model.description;
+    dexp.textContent = models.description;
     body.appendChild(dexp);
   }
 
@@ -2027,9 +2027,9 @@ function returnToEditor(id) {
 
 function renderDesktopWindow(id) {
   var inst = INST[id];
-  var model = resolveSchema(inst.modelName);
-  var props = model.properties || {};
-  var required = model.required || [];
+  var models = resolveSchema(inst.modelName);
+  var props = models.properties || {};
+  var required = models.required || [];
 
   var old = document.getElementById('dw-' + id);
   if (old) old.remove();
@@ -2100,10 +2100,10 @@ function renderDesktopWindow(id) {
   body.id = 'dwb-' + id;
   body.addEventListener('scroll', function(){ renderWires(); });
 
-  if (model.description && (DESC_MODE === 'collapsed' || DESC_MODE === 'expanded')) {
+  if (models.description && (DESC_MODE === 'collapsed' || DESC_MODE === 'expanded')) {
     var dd = document.createElement('div');
     dd.className = 'm-desc-expanded';
-    dd.textContent = model.description;
+    dd.textContent = models.description;
     body.appendChild(dd);
   }
   for (var fn in props) {
@@ -2782,9 +2782,9 @@ function validateAndShow() {
   var errors = [];
   Object.values(INST).forEach(function(inst) {
     if (!inst.enabled) return;
-    var model = resolveSchema(inst.modelName);
-    var req = model.required || [];
-    var props = model.properties || {};
+    var models = resolveSchema(inst.modelName);
+    var req = models.required || [];
+    var props = models.properties || {};
     req.forEach(function(fn) {
       var fs = props[fn] || {};
       if (getDirectRef(fs) || getOptionalRef(fs) || getArrayModelRef(fs) || getUnionRefs(fs)) return;
@@ -2979,9 +2979,9 @@ def up_server(
     accent_colors: dict | None = None,
 ) -> None:
     """
-    Launch a web editor for a Pydantic model.
+    Launch a web editor for a Pydantic models.
     Args:
-        model:        Pydantic model class (not instance).
+        model:        Pydantic models class (not instance).
         port:         Server port (default 8000).
         host:         Server host (default 0.0.0.0).
         open_browser: Auto-open browser tab (default True).
@@ -2993,7 +2993,7 @@ def up_server(
     model_name: str = model.__name__
     html = _build_html(model_name, schema, agent_manifest_mode, accent_colors)
 
-    app = FastAPI(title=f"Pydantic Editor — {model_name}")
+    app = FastAPI(title=f"Pydantic Editor - {model_name}")
 
     @app.get("/", response_class=HTMLResponse)
     async def index() -> HTMLResponse:

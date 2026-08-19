@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import os
 import asyncio
 import inspect
 import json
 import mimetypes
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -26,7 +27,7 @@ from slet_sdk.aelite.typing import StreamMode
 from slet_sdk.aelite.utils.device_info import get_device_string
 
 if TYPE_CHECKING:
-    from slet_sdk.aelite.manifest import AgentManifest, ToolConfig
+    from slet_sdk.aelite.manifest import AgentManifest, ToolConfig, ModelConfig
     from slet_sdk.aelite.resources.resource import AeliteResource
 
 
@@ -37,14 +38,14 @@ if TYPE_CHECKING:
 
 @dataclass
 class TextDelta:
-    """A chunk of the model's regular text response."""
+    """A chunk of the models's regular text response."""
 
     text: str
 
 
 @dataclass
 class ThinkingDelta:
-    """A chunk of the model's thinking/reasoning text."""
+    """A chunk of the models's thinking/reasoning text."""
 
     text: str
 
@@ -71,6 +72,23 @@ class _Error:
     error: ErrorResponse
 
 
+@dataclass
+class _MCPStdioProcess:
+    """
+    A locally running MCP server (stdio transport) plus the bookkeeping
+    needed to correlate outgoing JSON-RPC requests with their responses.
+
+    The server never sends us ``command``/``args`` - only ``server_id`` -
+    so the mapping ``server_id → local process`` must be maintained here,
+    on the client, exactly as documented in ``mcp_service.py``.
+    """
+
+    process: asyncio.subprocess.Process
+    pending: dict[str, asyncio.Future] = field(default_factory=dict)
+    reader_task: asyncio.Task | None = None
+    next_id: int = 0
+
+
 # Type of a queue item: either a stream chunk or a service marker.
 _QueueItem = StreamItem | _End | _Error
 
@@ -87,7 +105,7 @@ class AgentSession:
     Lifecycle
     ---------
     1. Create an instance via ``client.aelite.deploy_and_connect()``.
-    2. Call ``await session.connect()`` — the connection is established,
+    2. Call ``await session.connect()`` - the connection is established,
        and the background listener starts automatically.
     3. Use ``chat()`` / ``stream()`` for dialogue.
     4. Register callbacks (``on_message``, ``on_error``, etc.)
@@ -96,15 +114,15 @@ class AgentSession:
 
     Notes
     -----
-    - "Request — Response" mode: ``chat()`` and ``stream()``. Each call gets
-      its own ``msg`` identifier and is processed independently — you can
+    - "Request - Response" mode: ``chat()`` and ``stream()``. Each call gets
+      its own ``msg`` identifier and is processed independently - you can
       call ``stream()``/``chat()`` concurrently, they don't block each other.
     - The response is split into regular text (``TextDelta``) and the
-      model's thinking (``ThinkingDelta``), if the server/provider provides it.
+      models's thinking (``ThinkingDelta``), if the server/provider provides it.
     - Agent-initiated messages (broadcasts from triggers, including those
       launched by other devices of the same user) are routed via
       ``on_message`` (buffered) or ``on_incoming_stream`` (streamed), with
-      one callback invocation per independent ``msg`` — concurrent
+      one callback invocation per independent ``msg`` - concurrent
       unsolicited streams are not mixed with each other.
     - Automatic handling of client tool calls.
     - Automatic reconnect when the connection is dropped.
@@ -162,6 +180,11 @@ class AgentSession:
 
         # --- Client tool registry ---
         self._registered_tools: dict[str, Callable[..., Any]] = {}
+
+        # --- MCP stdio server registry ---
+        # server_id -> locally running process + pending JSON-RPC futures.
+        # Populated via register_mcp_server(); consulted in _handle_mcp_call().
+        self._mcp_stdio_servers: dict[str, _MCPStdioProcess] = {}
 
         # --- Internal machinery ---
 
@@ -238,6 +261,10 @@ class AgentSession:
         self._is_connected = False
 
         await self._cancel_listener()
+        self._cleanup_queues()
+
+        for server_id in list(self._mcp_stdio_servers):
+            await self.unregister_mcp_server(server_id)
 
         if self.websocket:
             await self.websocket.close()
@@ -259,7 +286,7 @@ class AgentSession:
         manifest contract.
 
         The manifest (``self.manifest.tools``) declares which client tools
-        the LLM may call and their expected parameter schema — it is the
+        the LLM may call and their expected parameter schema - it is the
         contract. This method registers the local Python implementation that
         fulfils that contract; the implementation does not need to share any
         object with whatever declared the contract, it only needs to match
@@ -300,7 +327,7 @@ class AgentSession:
             for name in missing:
                 self.logger.warning(
                     f"Client tool '{name}' is declared in the manifest but has no "
-                    f"local implementation registered — calls to it will fail "
+                    f"local implementation registered - calls to it will fail "
                     f"with 'not registered on client'."
                 )
 
@@ -312,7 +339,7 @@ class AgentSession:
         name: str = getattr(fn, "_tool_name", None) or fn.__name__
         if name in self._registered_tools:
             self.logger.warning(
-                f"Client tool '{name}' re-registered — overwriting previous handler."
+                f"Client tool '{name}' re-registered - overwriting previous handler."
             )
 
         contract = declared.get(name)
@@ -321,7 +348,7 @@ class AgentSession:
         elif declared:  # manifest known, but this tool isn't in it
             self.logger.warning(
                 f"Client tool '{name}' registered locally but not declared as a "
-                f"client tool in the deployed manifest — the LLM will never call it."
+                f"client tool in the deployed manifest - the LLM will never call it."
             )
 
         self._registered_tools[name] = fn
@@ -339,7 +366,7 @@ class AgentSession:
         here is a bug to surface, not a hard failure to block on."""
         local_params: dict[str, dict[str, Any]] = getattr(fn, "_tool_params", None)
         if local_params is None:
-            # fn wasn't decorated with @tool — we can't introspect its
+            # fn wasn't decorated with @tool - we can't introspect its
             # contract-relevant metadata, so skip conformance checking.
             return
 
@@ -351,12 +378,12 @@ class AgentSession:
             self.logger.warning(
                 f"Client tool '{name}': manifest declares parameter(s) "
                 f"{sorted(missing_in_impl)} that the local implementation does "
-                f"not accept — calls using them will fail."
+                f"not accept - calls using them will fail."
             )
         if extra_in_impl:
             self.logger.warning(
                 f"Client tool '{name}': local implementation has parameter(s) "
-                f"{sorted(extra_in_impl)} not declared in the manifest — the LLM "
+                f"{sorted(extra_in_impl)} not declared in the manifest - the LLM "
                 f"will never supply them, so make sure they have defaults."
             )
 
@@ -373,10 +400,99 @@ class AgentSession:
             if c_required and not l_required:
                 self.logger.warning(
                     f"Client tool '{name}', parameter '{pname}': manifest marks it "
-                    f"required, but the local implementation has a default — this "
+                    f"required, but the local implementation has a default - this "
                     f"is harmless but suggests the contract and implementation "
                     f"were written independently and may drift further."
                 )
+
+    async def register_mcp_server(
+            self,
+            server_id: str,
+            command: str,
+            args: list[str] | None = None,
+            env: dict[str, str] | None = None,
+    ) -> None:
+        """
+        Launches a local MCP server as a stdio subprocess and registers it
+        under ``server_id``.
+
+        This is the client-side counterpart of ``MCPTransportStdio`` in the
+        agent's manifest. The server only ever transmits ``server_id`` in
+        ``mcp_call`` events (never ``command``, to avoid arbitrary remote
+        command execution) - it is the client's job to know which local
+        process that id refers to, which is exactly what this method sets up.
+
+        Parameters
+        ----------
+        server_id:
+            Must match ``MCPServerConfig.id`` in the deployed manifest.
+        command:
+            Executable to launch (e.g. ``"npx"``, ``"python"``).
+        args:
+            Arguments passed to ``command``.
+        env:
+            Extra environment variables merged into the subprocess's
+            environment.
+
+        Raises
+        ------
+        SletClientError
+            If a server with this ``server_id`` is already registered.
+        """
+        if server_id in self._mcp_stdio_servers:
+            raise SletClientError(
+                CallbackError(
+                    message=f"MCP server '{server_id}' is already registered. "
+                            f"Call unregister_mcp_server() first."
+                )
+            )
+
+        merged_env = {**os.environ, **(env or {})}
+        process = await asyncio.create_subprocess_exec(
+            command,
+            *(args or []),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=merged_env,
+        )
+
+        entry = _MCPStdioProcess(process=process)
+        self._mcp_stdio_servers[server_id] = entry
+        entry.reader_task = asyncio.create_task(self._mcp_stdout_reader(server_id))
+
+        self.logger.info(
+            f"MCP stdio server '{server_id}' started: {command} {' '.join(args or [])}"
+        )
+
+    async def unregister_mcp_server(self, server_id: str) -> None:
+        """
+        Terminates and removes a previously registered MCP stdio server.
+
+        Safe to call for an unknown ``server_id`` - it's a no-op in that case.
+        """
+        entry = self._mcp_stdio_servers.pop(server_id, None)
+        if entry is None:
+            return
+
+        if entry.reader_task and not entry.reader_task.done():
+            entry.reader_task.cancel()
+
+        # Unblock any in-flight mcp_call waiting on this process.
+        for fut in entry.pending.values():
+            if not fut.done():
+                fut.set_exception(
+                    SletClientError(NetworkError(message=f"MCP server '{server_id}' unregistered."))
+                )
+
+        if entry.process.returncode is None:
+            entry.process.terminate()
+            try:
+                await asyncio.wait_for(entry.process.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                entry.process.kill()
+
+        self.logger.info(f"MCP stdio server '{server_id}' stopped.")
 
     # ------------------------------------------------------------------
     # Low-level sending
@@ -386,7 +502,7 @@ class AgentSession:
         """
         Sends a raw message over the WebSocket.
 
-        If a reconnect is currently in progress — waits for it to finish.
+        If a reconnect is currently in progress - waits for it to finish.
 
         Parameters
         ----------
@@ -419,7 +535,7 @@ class AgentSession:
         response items (``TextDelta`` / ``ThinkingDelta``).
 
         Each call gets its own ``msg`` and is processed independently of
-        other active ``stream()``/``chat()`` calls — they can be called
+        other active ``stream()``/``chat()`` calls - they can be called
         concurrently.
 
         Parameters
@@ -433,14 +549,14 @@ class AgentSession:
         Yields
         ------
         StreamItem
-            ``TextDelta`` — a chunk of the regular response text.
-            ``ThinkingDelta`` — a chunk of the model's thinking text (if any).
+            ``TextDelta`` - a chunk of the regular response text.
+            ``ThinkingDelta`` - a chunk of the models's thinking text (if any).
 
         Raises
         ------
         SletClientError
             On a connection error or if the agent/server returned an error
-            (including a msg conflict — practically impossible with UUID4,
+            (including a msg conflict - practically impossible with UUID4,
             but would still correctly surface as an exception).
         """
         attachments: list[dict] = []
@@ -489,11 +605,11 @@ class AgentSession:
     ) -> str:
         """
         Sends a message and returns the agent's full text response
-        (no thinking — only ``TextDelta``).
+        (no thinking - only ``TextDelta``).
 
         A convenience wrapper over ``stream()`` that collects text chunks
         into a single string. Use ``chat_with_thinking()`` if you also
-        need the model's thinking text.
+        need the models's thinking text.
 
         Parameters
         ----------
@@ -520,7 +636,7 @@ class AgentSession:
     ) -> tuple[str, str]:
         """
         Like ``chat()``, but additionally returns the accumulated
-        model thinking text.
+        models thinking text.
 
         Returns
         -------
@@ -544,9 +660,9 @@ class AgentSession:
         Parameters
         ----------
         file:
-            - ``str``       — text content (text/plain, UTF-8).
-            - ``bytes``     — raw bytes (application/octet-stream).
-            - file-like     — an object with a ``.read()`` method
+            - ``str``       - text content (text/plain, UTF-8).
+            - ``bytes``     - raw bytes (application/octet-stream).
+            - file-like     - an object with a ``.read()`` method
               (``BufferedReader``, ``SpooledTemporaryFile``, etc.).
 
         Returns
@@ -602,7 +718,7 @@ class AgentSession:
         Sends a trigger (event) to the agent without waiting for a response.
 
         The response to the trigger (and its errors) is broadcast to all
-        devices of the session, including the initiator — use the
+        devices of the session, including the initiator - use the
         ``on_message`` / ``on_incoming_stream`` / ``on_server_error``
         callbacks to receive it. The returned ``msg_id`` can be used to
         match it with these callbacks (they receive ``msg_id`` as the
@@ -618,7 +734,7 @@ class AgentSession:
         Returns
         -------
         str
-            The generated message identifier (``msg``) — for later
+            The generated message identifier (``msg``) - for later
             matching with unsolicited events.
 
         Raises
@@ -657,6 +773,42 @@ class AgentSession:
         event = {"type": "set_stream_mode", "mode": stream_mode}
         await self.send(json.dumps(event))
 
+    async def set_models(self, models: list[ModelConfig]) -> None:
+        """
+        Supplies this connection's own models fallback chain, entirely replacing
+        the agent's manifest-level ``models`` chain for requests sent on this
+        connection - the two are never merged.
+
+        Only accepted by agents deployed with
+        ``AgentManifest.model_rotation.allow_client_override=True``. If the
+        agent's manifest also leaves ``models`` empty, calling this is
+        mandatory before the first ``chat()``/``stream()``/``trigger()`` call,
+        since the server has no default chain to fall back to.
+
+        Does not affect requests already in progress; takes effect on the
+        next request. Sent as a dedicated WebSocket event rather than a query
+        parameter, since ``ModelConfig`` entries may carry an ``api_key``.
+
+        Parameters
+        ----------
+        models:
+            The models fallback chain to use for this connection, in priority
+            order. Must not be empty.
+
+        Raises
+        ------
+        ConnectionError
+            If the WebSocket is not connected.
+        """
+        if not self._is_connected:
+            raise ConnectionError("Not connected.")
+
+        event = {
+            "type": "set_models",
+            "models": [m.model_dump(mode="json") for m in models],
+        }
+        await self.send(json.dumps(event))
+
     # ------------------------------------------------------------------
     # Helper private methods
     # ------------------------------------------------------------------
@@ -678,7 +830,7 @@ class AgentSession:
 
         # Called when a full unsolicited message is received.
         # (stream_unsolicited=False). Signature: (text, thinking, msg_id).
-        # thinking — an empty string if there was no thinking.
+        # thinking - an empty string if there was no thinking.
         self.on_message: (
             Callable[[str, str, str], None | Awaitable[None]]
         ) | None = None
@@ -705,7 +857,7 @@ class AgentSession:
             Callable[[ErrorResponse, str | None], None | Awaitable[None]]
         ) | None = None
 
-        # Notification of a model/provider change.
+        # Notification of a models/provider change.
         self.on_model_change: (
             Callable[[str, str, str], None | Awaitable[None]]
         ) | None = None
@@ -761,7 +913,7 @@ class AgentSession:
 
         All protocol messages are JSON with a ``type`` field. Routing is
         done by event type and by the ``msg`` field (if present): if
-        ``msg`` matches an active ``stream()``/``chat()`` — it goes to its
+        ``msg`` matches an active ``stream()``/``chat()`` - it goes to its
         queue, otherwise it's handled as unsolicited (broadcast from a
         trigger, including one launched by another device).
 
@@ -831,6 +983,9 @@ class AgentSession:
         elif event_type == "client_tool_call":
             asyncio.create_task(self._handle_client_tool_call(data.get("payload", {})))
 
+        elif event_type == "mcp_call":
+            asyncio.create_task(self._handle_mcp_call(data.get("payload", {})))
+
         elif event_type == "tool_start":
             name: str = data.get("payload", {}).get("name", "")
             self._invoke_callback(self.on_tool_start, name, msg_id)
@@ -840,7 +995,7 @@ class AgentSession:
             self._invoke_callback(
                 self.on_model_change,
                 payload.get("provider"),
-                payload.get("model"),
+                payload.get("models"),
                 payload.get("source", "server"),
             )
 
@@ -909,13 +1064,13 @@ class AgentSession:
         ----------
         msg_id:
             The message identifier from the server. If the server for some
-            reason did not send a ``msg`` — the event is logged and
+            reason did not send a ``msg`` - the event is logged and
             dropped, since it cannot be correctly grouped with the rest.
         item:
             A chunk of text/thinking from the agent.
         """
         if msg_id is None:
-            self.logger.warning("Unsolicited event without msg — dropped.")
+            self.logger.warning("Unsolicited event without msg - dropped.")
             return
 
         if self.stream_unsolicited:
@@ -1109,6 +1264,116 @@ class AgentSession:
 
         if self._is_connected:
             await self.websocket.send(json.dumps(response))
+
+    async def _mcp_stdout_reader(self, server_id: str) -> None:
+        """
+        Continuously reads newline-delimited JSON-RPC responses from an MCP
+        stdio process's stdout and resolves the matching pending future by
+        the response's ``id``.
+
+        Terminates when the process closes stdout (crash or normal exit);
+        any requests still awaiting a response at that point are failed
+        instead of hanging forever.
+        """
+        entry = self._mcp_stdio_servers.get(server_id)
+        if entry is None:
+            return
+
+        try:
+            while True:
+                line = await entry.process.stdout.readline()
+                if not line:
+                    break
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    self.logger.warning(
+                        f"MCP server '{server_id}' sent a non-JSON line: {line!r}"
+                    )
+                    continue
+
+                resp_id = str(data.get("id"))
+                fut = entry.pending.pop(resp_id, None)
+                if fut is not None and not fut.done():
+                    fut.set_result(data)
+
+        except Exception as e:
+            self.logger.error(f"MCP stdio reader for '{server_id}' crashed: {e}")
+
+        finally:
+            for fut in entry.pending.values():
+                if not fut.done():
+                    fut.set_exception(
+                        SletClientError(
+                            NetworkError(message=f"MCP server '{server_id}' stdout closed.")
+                        )
+                    )
+
+    async def _handle_mcp_call(self, payload: dict) -> None:
+        """
+        Handles an ``mcp_call`` event initiated by the agent.
+
+        Forwards a JSON-RPC 2.0 request to the local stdio process
+        registered under ``payload['server_id']``, waits for the matching
+        response, and sends the result back to the server as ``mcp_result``.
+
+        Parameters
+        ----------
+        payload:
+            Dict with ``server_id``, ``method``, ``params``, ``call_id``,
+            and ``pod_id`` (echoed back verbatim so the server routes the
+            response to the pod that is actually waiting on it).
+        """
+        server_id: str = payload.get("server_id", "")
+        method: str = payload.get("method", "")
+        params: dict = payload.get("params", {})
+        call_id: str = payload.get("call_id", "")
+        pod_id = payload.get("pod_id")
+
+        entry = self._mcp_stdio_servers.get(server_id)
+        result: dict
+
+        if entry is None:
+            result = {"error": {"message": f"MCP server '{server_id}' not registered on client."}}
+            self.logger.warning(result["error"]["message"])
+        else:
+            entry.next_id += 1
+            rpc_id = str(entry.next_id)
+            loop = asyncio.get_running_loop()
+            fut: asyncio.Future = loop.create_future()
+            entry.pending[rpc_id] = fut
+
+            request = {"jsonrpc": "2.0", "id": rpc_id, "method": method, "params": params}
+
+            try:
+                entry.process.stdin.write((json.dumps(request) + "\n").encode("utf-8"))
+                await entry.process.stdin.drain()
+                response = await asyncio.wait_for(fut, timeout=30)
+                # Сервер (mcp_service.py) читает именно "result" объект
+                # напрямую (result.get("tools", [])/["contents"]/["content"]),
+                # поэтому пробрасываем содержимое result "как есть".
+                result = response.get("result") or response.get("error", {})
+            except asyncio.TimeoutError:
+                result = {"error": {"message": f"MCP call '{method}' on '{server_id}' timed out."}}
+                self.logger.warning(result["error"]["message"])
+            except Exception as e:
+                result = {"error": {"message": str(e)}}
+                self.logger.error(f"MCP call to '{server_id}' failed: {e}")
+            finally:
+                # noinspection PyAsyncCall
+                entry.pending.pop(rpc_id, None)
+
+        response_event = {
+            "type": "mcp_result",
+            "payload": {
+                "call_id": call_id,
+                "result": result,
+                "pod_id": pod_id,
+            },
+        }
+
+        if self._is_connected:
+            await self.websocket.send(json.dumps(response_event))
 
     # ------------------------------------------------------------------
     # Reconnect

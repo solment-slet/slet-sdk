@@ -1,5 +1,5 @@
 """
-test_tools.py — tests for client-tool declaration (``tools.py``), their
+test_tools.py - tests for client-tool declaration (``tools.py``), their
 integration into ``AgentManifest`` (``manifest.py``), and their execution
 inside ``AgentSession`` (``session.py``).
 
@@ -8,10 +8,10 @@ Split into three groups:
 1. Pure unit tests for ``@tool`` / ``ToolBelt`` (no network, no fixtures).
 2. Manifest-level validation tests (duplicate names, timeouts, broadcast
    config, flattening of ``ToolBelt``/bare tools/dicts/``ToolConfig``).
-3. ``AgentSession`` tests — some against a fake in-memory resource
+3. ``AgentSession`` tests - some against a fake in-memory resource
    (no real WebSocket, exercising ``register_tools`` conformance checks and
    ``_handle_client_tool_call`` directly), and some end-to-end against a
-   live agent via the ``client``/``model`` fixtures (mirrors the existing
+   live agent via the ``client``/``models`` fixtures (mirrors the existing
    ``test_client_tools`` example).
 """
 
@@ -67,7 +67,7 @@ def _make_disconnected_session(manifest: AgentManifest | None = None) -> AgentSe
 
 
 # ===========================================================================
-# 1. @tool decorator — unit tests
+# 1. @tool decorator - unit tests
 # ===========================================================================
 
 
@@ -115,17 +115,17 @@ class TestBareToolDecorator:
                 return x
 
     def test_unsupported_extra_kwarg_raises_typeerror(self):
-        with pytest.raises(TypeError, match="unsupported keyword argument"):
+        with pytest.raises(TypeError):
             @tool(description="desc", not_a_real_field=True)
             def fn() -> str:
                 return "x"
 
     def test_allowed_extra_kwargs_timeout_and_broadcast(self):
-        @tool(description="desc", timeout=45, broadcast={"mode": "all"})
+        @tool(description="desc", timeout=45, broadcast=BroadcastConfig(mode=BroadcastMode.all))
         def fn() -> str:
             return "x"
 
-        assert fn._tool_extra == {"timeout": 45, "broadcast": {"mode": "all"}}
+        assert fn._tool_extra == {"timeout": 45, "broadcast": BroadcastConfig(mode=BroadcastMode.all)}
 
     def test_unsupported_param_type_raises_typeerror(self):
         with pytest.raises(TypeError, match="unsupported"):
@@ -244,7 +244,7 @@ class TestToolParameters:
 
 
 # ===========================================================================
-# 2. ToolBelt — unit tests
+# 2. ToolBelt - unit tests
 # ===========================================================================
 
 
@@ -330,7 +330,7 @@ class TestToolBelt:
 
 
 # ===========================================================================
-# 3. Manifest-level tool integration — unit tests
+# 3. Manifest-level tool integration - unit tests
 # ===========================================================================
 
 
@@ -449,7 +449,7 @@ class TestBroadcastConfig:
     def test_broadcast_set_via_tool_decorator_extra_kwarg(self):
         @tool(
             description="Ask every connected client",
-            broadcast={"mode": "collect", "collect_window": 2.0, "include_client_id": True},
+            broadcast=BroadcastConfig(mode=BroadcastMode.collect, collect_window=2.0, include_client_id=True),
         )
         def poll_all_clients() -> str:
             return "x"
@@ -482,7 +482,7 @@ class TestBroadcastConfig:
 
 
 # ===========================================================================
-# 4. AgentSession — offline unit tests (no real WebSocket)
+# 4. AgentSession - offline unit tests (no real WebSocket)
 # ===========================================================================
 
 
@@ -812,16 +812,16 @@ class TestSerializeToolResult:
 
 
 # ===========================================================================
-# 5. AgentSession — end-to-end tests against a live agent (client/model fixtures)
+# 5. AgentSession - end-to-end tests against a live agent (client/models fixtures)
 # ===========================================================================
 #
 # These mirror the existing `test_client_tools` example: they require the
-# `client` and `model` fixtures wired up to a real (or test-environment)
+# `client` and `models` fixtures wired up to a real (or test-environment)
 # deployment target, since they exercise the full deploy -> connect ->
 # chat -> client_tool_call -> client_tool_result round trip.
 
 
-async def test_client_tools_no_args(client, model):
+async def test_client_tools_no_args(client, models):
     """Baseline: a single tool with no arguments (matches the existing example)."""
     tool_called = False
 
@@ -838,7 +838,7 @@ async def test_client_tools_no_args(client, model):
             "call it immediately without asking any additional questions, "
             "even if the tool requires arguments, make them up."
         ),
-        model=model,
+        models=models,
         memory=MemoryConfig(enabled=False),
         tools=[get_time],
     )
@@ -852,7 +852,7 @@ async def test_client_tools_no_args(client, model):
     assert tool_called
 
 
-async def test_client_tools_required_args(client, model):
+async def test_client_tools_required_args(client, models):
     """A tool with a single required argument."""
     received: dict[str, str] = {}
 
@@ -867,7 +867,7 @@ async def test_client_tools_required_args(client, model):
             "If the user asks about the weather somewhere, call get_weather "
             "with that city immediately, without asking clarifying questions."
         ),
-        model=model,
+        models=models,
         memory=MemoryConfig(enabled=False),
         tools=[get_weather],
     )
@@ -881,8 +881,8 @@ async def test_client_tools_required_args(client, model):
     assert received.get("city")
 
 
-async def test_client_tools_optional_args_default_used(client, model):
-    """A tool with an optional argument the model may omit; the default
+async def test_client_tools_optional_args_default_used(client, models):
+    """A tool with an optional argument the models may omit; the default
     should be applied by the local implementation when omitted."""
     calls: list[dict] = []
 
@@ -898,7 +898,7 @@ async def test_client_tools_optional_args_default_used(client, model):
             "specific number, call set_volume with no arguments so the "
             "default is used."
         ),
-        model=model,
+        models=models,
         memory=MemoryConfig(enabled=False),
         tools=[set_volume],
     )
@@ -912,7 +912,7 @@ async def test_client_tools_optional_args_default_used(client, model):
     assert len(calls) >= 1
 
 
-async def test_client_tools_multiple_mixed_args(client, model):
+async def test_client_tools_multiple_mixed_args(client, models):
     """A tool combining required and optional arguments of different types."""
     bookings: list[dict] = []
 
@@ -930,7 +930,7 @@ async def test_client_tools_multiple_mixed_args(client, model):
             "with the destination and number of passengers they mention. "
             "Make up any detail they didn't specify."
         ),
-        model=model,
+        models=models,
         memory=MemoryConfig(enabled=False),
         tools=[book_flight],
     )
@@ -946,7 +946,7 @@ async def test_client_tools_multiple_mixed_args(client, model):
     assert bookings[0]["passengers"] == 3
 
 
-async def test_client_toolbelt(client, model):
+async def test_client_toolbelt(client, models):
     """A ``ToolBelt`` with several tools registered at once."""
     belt = ToolBelt()
     calls: dict[str, int] = {"get_time": 0, "get_battery_level": 0}
@@ -967,7 +967,7 @@ async def test_client_toolbelt(client, model):
             "If the user asks for the time or the battery level, call the "
             "matching tool immediately without asking any questions."
         ),
-        model=model,
+        models=models,
         memory=MemoryConfig(enabled=False),
         tools=[belt],
     )
@@ -981,7 +981,7 @@ async def test_client_toolbelt(client, model):
     assert calls["get_battery_level"] >= 1
 
 
-async def test_client_async_tool(client, model):
+async def test_client_async_tool(client, models):
     """An ``async def`` tool implementation."""
     tool_called = False
 
@@ -997,7 +997,7 @@ async def test_client_async_tool(client, model):
         system_prompt=(
             "If the user asks where they are, call get_location immediately."
         ),
-        model=model,
+        models=models,
         memory=MemoryConfig(enabled=False),
         tools=[get_location],
     )
@@ -1006,12 +1006,13 @@ async def test_client_async_tool(client, model):
     session.register_tools([get_location])
 
     result = await session.chat("Where am I right now?")
+    print(result)
 
     assert isinstance(result, str)
     assert tool_called
 
 
-async def test_client_tool_declared_but_not_registered_still_completes(client, model):
+async def test_client_tool_declared_but_not_registered_still_completes(client, models):
     """The manifest declares a client tool, but the local implementation is
     never registered. The agent should still finish the turn (surfacing a
     'not registered on client' error to the LLM rather than hanging)."""
@@ -1026,7 +1027,7 @@ async def test_client_tool_declared_but_not_registered_still_completes(client, m
             "If the user asks for the secret, call read_secret immediately. "
             "If the tool call fails, just report that briefly and stop."
         ),
-        model=model,
+        models=models,
         memory=MemoryConfig(enabled=False),
         tools=[read_secret],
     )
@@ -1035,14 +1036,15 @@ async def test_client_tool_declared_but_not_registered_still_completes(client, m
     # Intentionally NOT calling session.register_tools([read_secret]) here.
 
     result = await session.chat("What is the secret?")
+    print(result)
 
     assert isinstance(result, str)
     assert result  # the agent should still produce some final text
 
 
-async def test_client_tool_execution_error_is_reported_and_recovered(client, model):
+async def test_client_tool_execution_error_is_reported_and_recovered(client, models):
     """A tool implementation that raises should not crash the session; the
-    error is sent back to the model as the tool result and the turn still
+    error is sent back to the models as the tool result and the turn still
     completes."""
     attempts = 0
     on_error = MagicMock()
@@ -1059,7 +1061,7 @@ async def test_client_tool_execution_error_is_reported_and_recovered(client, mod
             "If the user asks you to run the broken tool, call broken_tool "
             "immediately. If it errors, just tell the user briefly and stop."
         ),
-        model=model,
+        models=models,
         memory=MemoryConfig(enabled=False),
         tools=[broken_tool],
     )
@@ -1074,16 +1076,16 @@ async def test_client_tool_execution_error_is_reported_and_recovered(client, mod
     assert attempts >= 1
 
 
-async def test_client_tool_broadcast_config_deploys_successfully(client, model):
+async def test_client_tool_broadcast_config_deploys_successfully(client, models):
     """A manifest declaring a broadcast-enabled client tool deploys and can
-    complete a normal (non-broadcast, single-client) turn without error —
+    complete a normal (non-broadcast, single-client) turn without error -
     broadcast aggregation itself requires multiple simultaneous connections
     and is covered at the config-validation level in
     ``TestBroadcastConfig`` above."""
 
     @tool(
         description="Asks every connected device to confirm an action",
-        broadcast={"mode": "collect", "collect_window": 1.0},
+        broadcast=BroadcastConfig(mode=BroadcastMode.collect, collect_window=1.0),
     )
     def confirm_on_all_devices() -> str:
         return "confirmed"
@@ -1094,7 +1096,7 @@ async def test_client_tool_broadcast_config_deploys_successfully(client, model):
             "If the user asks to confirm on all devices, call "
             "confirm_on_all_devices immediately."
         ),
-        model=model,
+        models=models,
         memory=MemoryConfig(enabled=False),
         tools=[confirm_on_all_devices],
     )

@@ -77,7 +77,7 @@ async def main():
             f"\n🔧 Вызван инструмент: {tool_name} [{msg_id}]"
         )
 
-        # on_error — сигнатура не изменилась
+        # on_error - сигнатура не изменилась
         session.on_error = lambda err: print(f"\n❌ Ошибка! {str(err)}")
 
         # Новый колбэк: ошибки сервера, привязанные к msg (или None)
@@ -85,7 +85,7 @@ async def main():
             f"\n❌ Ошибка сервера [{msg_id}]: {str(err)}"
         )
 
-        # Основной цикл (бесконечный, с прикреплением файлов) — без изменений
+        # Основной цикл (бесконечный, с прикреплением файлов) - без изменений
         while True:
             # Сбрасываем буфер перед чтением
             await asyncio.get_event_loop().run_in_executor(None, sys.stdin.flush)

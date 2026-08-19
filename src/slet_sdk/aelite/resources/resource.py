@@ -40,23 +40,23 @@ class AeliteResource(BaseResource):
         """Установить соединение с сессией.
 
         Строит дерево сессий для root-агента и, опционально, всех его подагентов.
-        Если манифест не передан — загружается с сервера автоматически.
+        Если манифест не передан - загружается с сервера автоматически.
 
         Args:
             session_id: Идентификатор треда. Принимается в трёх форматах:
-                - ``str`` — ID root-агента; словарь thread_id для подагентов
+                - ``str`` - ID root-агента; словарь thread_id для подагентов
                   будет собран автоматически на основе манифеста.
-                - ``dict[str, str]`` — готовый словарь вида ``{agent_name: thread_id}``.
-                - ``ThreadInfo`` — объект ответа деплоя; словарь
+                - ``dict[str, str]`` - готовый словарь вида ``{agent_name: thread_id}``.
+                - ``ThreadInfo`` - объект ответа деплоя; словарь
                   извлекается из поля ``agent_ids``.
             manifest: Манифест, использованный при деплое агента.
                 Если не передан, запрашивается у сервера по ``thread_id``.
             device: Произвольная строка-идентификатор устройства клиента.
                 Позволяет агенту различать подключения одного пользователя
-                с разных устройств. Если не указан — генерируется автоматически.
+                с разных устройств. Если не указан - генерируется автоматически.
             stream_mode: Способ стриминга ответов агента.
             recursion: Если ``True`` (по умолчанию), подключаются root-агент
-                и все подагенты. Если ``False`` — только root-агент.
+                и все подагенты. Если ``False`` - только root-агент.
 
         Returns:
             Сессия ``AgentSession`` для взаимодействия с агентом.
@@ -141,7 +141,7 @@ class AeliteResource(BaseResource):
         elif isinstance(agent, AgentInfo):
             agent_id = agent.id
         else:
-            raise TypeError(f"Agent must be an instance of UUID or AgentInfo, got {type(agent).__name__}")
+            raise TypeError(f"Agent must be an instance of UUID or AgentInfo, got {type(agent).__name__!r}")
 
         # Create thread
         thread = await self.threads.create_thread(
@@ -177,7 +177,7 @@ class AeliteResource(BaseResource):
         elif isinstance(thread, UUID):
             thread_id = thread
         else:
-            raise TypeError(f"Thread must be an instance of UUID or ThreadInfo, got {type(thread).__name__}")
+            raise TypeError(f"Thread must be an instance of UUID or ThreadInfo, got {type(thread).__name__!r}")
 
         return await self.connect(
             thread_id,

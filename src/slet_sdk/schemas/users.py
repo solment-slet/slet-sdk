@@ -3,7 +3,7 @@ from slet_sdk.typing import UserPrivilege
 
 
 class UserContext(BaseModel):
-    """Легковесная модель из JWT — без похода в БД."""
+    """Легковесная модель из JWT - без похода в БД."""
 
     id: int
     name: str

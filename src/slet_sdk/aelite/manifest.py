@@ -1,37 +1,28 @@
 """
-manifest.py — Declarative agent configuration schema.
+manifest.py - Declarative agent configuration schema.
 
-This module defines the complete Pydantic model hierarchy used to describe
+This module defines the complete Pydantic models hierarchy used to describe
 an agent and all its runtime behaviour: LLM parameters, persistent memory,
 RAG retrieval, node-level caching, A-MEM knowledge graph, dynamic tool
 retrieval, tool inheritance, triggers, and peripheral components.
 
-A manifest is submitted once via ``POST /agent/deploy/{session_id}``,
-serialised to Redis, and used by ``AgentFactory`` to compile a LangGraph
-graph that is cached in memory per replica. Sub-agents are fully recursive —
-each sub-agent is itself an ``AgentManifest`` and is deployed as an
-independent entity with its own ``session_id`` and WebSocket endpoint.
-
-Credential handling
--------------------
-Fields that may contain sensitive connection strings (``connection_url``)
-are marked ``exclude=True`` so they are never written to Redis or returned
-in API responses. Prefer ``connection_url_env`` (the name of a server-side
-environment variable) over inline credentials.
+Sub-agents are fully recursive - each sub-agent is itself an ``AgentManifest``
+and is deployed as an independent entity with its own ``session_id``
+and WebSocket endpoint.
 
 System-prompt variables
 -----------------------
 The following placeholders are expanded before every LLM call:
 
-- ``{time}`` — current server time (always available)
-- ``{summary}`` — rolling conversation summary
-                          (requires ``memory.enabled = True`` and
+- ``{time}`` - current server time (always available)
+- ``{summary}`` - rolling conversation summary
+                          (requires ``memory.checkpointing = True`` and
                           ``memory.summarization`` set to ``'async'``
                           or ``'blocking'``)
-- ``{amem}`` — A-MEM knowledge-graph notes
+- ``{amem}`` - A-MEM knowledge-graph notes
                           (requires ``memory.agentic.enabled = True``;
                           variable name overridable via ``inject_variable``)
-- ``{rag_<name>}`` — RAG chunks for the source whose ``name`` field
+- ``{rag_<name>}`` - RAG chunks for the source whose ``name`` field
                           equals ``<name>`` (requires ``rag.enabled = True``
                           and ``inject_as = 'system_variable'``)
 
@@ -74,7 +65,7 @@ class AgentPermissions(BaseModel):
     - ``whitelist``: only users explicitly listed in ``allowed_users``.
     - ``public``: any authenticated user.
 
-    ``deploy`` and ``delete`` do not support ``public`` — granting arbitrary
+    ``deploy`` and ``delete`` do not support ``public`` - granting arbitrary
     users the ability to overwrite or destroy an agent is intentionally
     disallowed.
     """
@@ -83,7 +74,7 @@ class AgentPermissions(BaseModel):
         default=PermissionLevel.owner_only,
         description=(
             "Who can retrieve this agent's manifest via ``GET /agent/{agent}``. "
-            "Defaults to ``owner_only`` — manifests are private unless explicitly "
+            "Defaults to ``owner_only`` - manifests are private unless explicitly "
             "opened. Set to ``public`` to make the agent's configuration visible "
             "to any authenticated user, or ``whitelist`` to share with a specific group."
         ),
@@ -102,7 +93,7 @@ class AgentPermissions(BaseModel):
         description=(
             "Who can push a new version of this agent via ``PUT /agent/{agent}``. "
             "Defaults to ``owner_only``. Set to ``whitelist`` to allow a team "
-            "of developers to deploy updates. ``public`` is not permitted — "
+            "of developers to deploy updates. ``public`` is not permitted - "
             "unrestricted write access to agent logic is a security risk."
         ),
     )
@@ -118,7 +109,7 @@ class AgentPermissions(BaseModel):
         description=(
             "Explicit list of user IDs granted access when any permission field "
             "is set to ``whitelist``. A single list applies across all whitelist "
-            "permissions — if granular per-action whitelists are needed, "
+            "permissions - if granular per-action whitelists are needed, "
             "deploy separate agents with different configurations."
         ),
     )
@@ -179,7 +170,7 @@ class ConcurrencyConfig(BaseModel):
         default="sequential",
         description=(
             "Message processing strategy:\n"
-            " - ``'sequential'``: Redis lock serialises all requests for this "
+            " - ``'sequential'``: Valkey lock serialises all requests for this "
             "thread across replicas.\n"
             " - ``'parallel'``: no router-level lock. Atomicity is enforced "
             "by the checkpointer's short write-lock."
@@ -418,7 +409,7 @@ class BroadcastConfig(BaseModel):
 
     When a client tool is invoked in broadcast mode, the server publishes a
     ``client_tool_call`` event to **all** WebSocket connections on the current
-    ``session_id`` (across all pods via Redis pub/sub) and then aggregates the
+    ``session_id`` (across all pods via Valkey pub/sub) and then aggregates the
     responses according to ``mode`` before returning a single string to the LLM.
 
     The aggregated result always follows this format::
@@ -509,18 +500,15 @@ class ModelConfig(BaseModel):
     """
     Per-agent LLM sampling parameters.
     """
-    base_url: str | None = Field(
-        default=None,
+    base_url: str = Field(
         min_length=8,
         max_length=500,
     )
-    model: str | None = Field(
-        default=None,
+    model: str = Field(
         min_length=1,
         max_length=200,
     )
-    api_key: str | None = Field(
-        default=None,
+    api_key: str = Field(
         min_length=1,
         max_length=512,
     )
@@ -562,7 +550,7 @@ class ModelConfig(BaseModel):
     is_reasoning_model: bool = Field(
         default=False,
         description=(
-            "Mark this custom model as an OpenAI o1/o3-style reasoning model. "
+            "Mark this custom models as an OpenAI o1/o3-style reasoning model. "
             "When true, temperature/top_p are omitted from requests, since "
             "these models reject them."
         ),
@@ -573,7 +561,7 @@ class ModelConfig(BaseModel):
             "Reasoning effort for OpenAI-style reasoning models (o1/o3 and "
             "compatible proxies). Higher effort trades latency and cost for "
             "better reasoning quality. Ignored by non-reasoning models. "
-            "Only applicable to ProviderKind.OPENAI_COMPATIBLE — Anthropic "
+            "Only applicable to ProviderKind.OPENAI_COMPATIBLE - Anthropic "
             "has no equivalent parameter (use thinking_budget_tokens instead)."
         ),
     )
@@ -593,36 +581,45 @@ class ModelConfig(BaseModel):
         default=None,
         ge=1024,
         description=(
-            "Token budget allocated to the model's internal reasoning pass. "
+            "Token budget allocated to the models's internal reasoning pass. "
             "Only applies when thinking_enabled=True. Primarily relevant to "
             "Anthropic extended thinking; ignored by providers that don't "
             "support a configurable reasoning budget."
         ),
     )
-
-    @model_validator(mode="after")
-    def _validate_custom_provider_completeness(self):
-        """
-        base_url/model/api_key must be provided all together (a fully
-        specified custom provider) or all omitted (fall back to the
-        server's global provider pool). Partial specification is always
-        a configuration mistake.
-        """
-        provided = [self.base_url is not None, self.model is not None, self.api_key is not None]
-        if any(provided) and not all(provided):
-            raise ValueError(
-                "base_url, model and api_key must all be provided together "
-                "for a custom provider entry, or all omitted to fall back "
-                "to the server's default provider pool."
-            )
-        return self
+    use_for_amem: bool = Field(
+        default=False,
+        description=(
+            "Marks this entry in a `models` fallback chain as eligible for "
+            "A-MEM's own LLM calls (note extraction/evolution). A-MEM never "
+            "falls back to the server's default provider pool - when "
+            "`memory.agentic.enabled=True`, at least one entry in the "
+            "resolved models chain (manifest `models`, or the client-"
+            "supplied override when `allow_client_override=True`) must set "
+            "this to True, otherwise the manifest/override is rejected. "
+            "A-MEM only ever tries entries with this flag set, in their "
+            "original chain order."
+        ),
+    )
+    use_for_rerank: bool = Field(
+        default=False,
+        description=(
+            "Marks this entry in a `models` fallback chain as eligible for "
+            "the RAG reranker's LLM calls when `RAGRerankerConfig.type == "
+            "'llm'`. Mirrors `use_for_amem` - the LLM reranker never falls "
+            "back to the server's default provider pool. When a RAG "
+            "source's reranker.type='llm' and `models` is non-empty, at "
+            "least one entry in the resolved models chain must set this to "
+            "True, otherwise the manifest is rejected."
+        ),
+    )
 
     @model_validator(mode="after")
     def _validate_thinking_requires_reasoning_mode(self):
         """
         For ProviderKind.OPENAI_COMPATIBLE, thinking_enabled only has an
         effect inside the `if is_reasoning_model:` branch in _build_llm
-        (app/services/model_manager.py) — that's where extra_body with
+        (app/services/model_manager.py) - that's where extra_body with
         reasoning_format is attached. If is_reasoning_model=False and
         reasoning_effort is unset, that whole branch is skipped and
         thinking_enabled is silently a no-op: the request never asks the
@@ -641,10 +638,10 @@ class ModelConfig(BaseModel):
             raise ValueError(
                 "thinking_enabled=True has no effect for an OPENAI_COMPATIBLE "
                 "provider unless is_reasoning_model=True or reasoning_effort "
-                "is set — otherwise the reasoning_format request parameter is "
+                "is set - otherwise the reasoning_format request parameter is "
                 "never sent and no reasoning/thinking content will be "
                 "returned. Set is_reasoning_model=True (and/or reasoning_effort) "
-                "if this model is a reasoning model, or set thinking_enabled=False."
+                "if this models is a reasoning models, or set thinking_enabled=False."
             )
         return self
 
@@ -654,12 +651,12 @@ class ModelConfig(BaseModel):
         reasoning_effort is an OpenAI-style reasoning API concept (o1/o3/
         gpt-oss and OpenAI-compatible proxies). Anthropic's extended
         thinking is controlled via thinking_enabled + thinking_budget_tokens
-        instead — _build_llm never reads reasoning_effort for
+        instead - _build_llm never reads reasoning_effort for
         ProviderKind.ANTHROPIC, so setting it there is silently ignored.
         """
         if self.kind == ProviderKind.ANTHROPIC and self.reasoning_effort:
             raise ValueError(
-                "reasoning_effort has no effect for kind=ANTHROPIC — Anthropic "
+                "reasoning_effort has no effect for kind=ANTHROPIC - Anthropic "
                 "extended thinking is controlled via thinking_enabled and "
                 "thinking_budget_tokens instead. Remove reasoning_effort or "
                 "use thinking_budget_tokens to control reasoning depth."
@@ -675,11 +672,11 @@ class ModelConfig(BaseModel):
 class ModelRotationScope(StrEnum):
     thread = "thread"
     """
-    Default. Fallback/rotation progress within ``AgentManifest.model`` is
+    Default. Fallback/rotation progress within ``AgentManifest.models`` is
     shared across every WebSocket connection attached to this thread on a
-    given pod — mirrors the pre-existing behaviour where a single
+    given pod - mirrors the pre-existing behaviour where a single
     ResilientChatModel instance served the whole thread. Appropriate when
-    ``model`` describes infrastructure the operator controls (e.g. the
+    ``models`` describes infrastructure the operator controls (e.g. the
     server's own provider pool, or a custom chain shared by a team), rather
     than per-user credentials.
     """
@@ -688,27 +685,27 @@ class ModelRotationScope(StrEnum):
     Each WebSocket connection tracks its own fallback/rotation progress
     independently, even for the same thread_id. Required whenever different
     connections to the same thread may belong to different people with
-    different credentials or preferences — otherwise one connection's dead
+    different credentials or preferences - otherwise one connection's dead
     custom provider would silently degrade another connection's requests.
     """
 
 
 class ModelRotationPolicy(BaseModel):
     """
-    Controls how ``AgentManifest.model`` fallback state is shared (or not)
+    Controls how ``AgentManifest.models`` fallback state is shared (or not)
     across the WebSocket connections attached to a thread, and whether a
-    connecting client may supply its own model chain instead of using the
+    connecting client may supply its own models chain instead of using the
     manifest's.
     """
 
     scope: ModelRotationScope = Field(
         default=ModelRotationScope.thread,
         description=(
-            "Whether model fallback/rotation progress is shared across all "
+            "Whether models fallback/rotation progress is shared across all "
             "connections to this thread, or isolated per WebSocket "
             "connection. Forced to per-connection isolation automatically "
             "for any connection that has an active client-supplied override "
-            "(see allow_client_override) regardless of this setting — a "
+            "(see allow_client_override) regardless of this setting - a "
             "client-supplied chain, and any credentials embedded in it, "
             "must never be shared with other connections on the same thread."
         ),
@@ -719,19 +716,110 @@ class ModelRotationPolicy(BaseModel):
             "When True, a connecting client may send a 'set_models' event "
             "over the WebSocket (before or between 'message'/'trigger' "
             "events) carrying its own list[ModelConfig], which entirely "
-            "replaces AgentManifest.model for that connection's requests. "
+            "replaces AgentManifest.models for that connection's requests. "
             "Rotation for that connection is then always isolated "
             "per-connection, regardless of the configured scope value. "
-            "When this is True and AgentManifest.model is empty, every "
+            "When this is True and AgentManifest.models is empty, every "
             "connection MUST send 'set_models' before sending its first "
-            "'message'/'trigger', since there is no server-side default "
-            "chain to fall back to — see AgentManifest.model's docstring."
+            "'message'/'trigger', since the agent has no chain configured "
+            "to use otherwise - see AgentManifest.models's docstring."
         ),
     )
 
 
 # ===========================================================================
-# RAG — Retrieval-Augmented Generation
+# Embeddings
+# ===========================================================================
+
+
+class EmbedConfig(BaseModel):
+    """
+    A single embedding provider entry for the OpenAI-compatible
+    `/embeddings` endpoint. Anthropic has no embeddings API, so unlike
+    ModelConfig there's no `kind` discriminator here.
+
+    `embeds` on AgentManifest is a feature-agnostic, shared chain - any
+    component that needs vector embeddings (A-MEM today, RAG and others in
+    the future) opts in via its own `use_for_*` flag on each entry, instead
+    of each feature owning a private embedding config. This mirrors
+    ModelConfig.use_for_amem: nothing here ever falls back to an implicit
+    default embedding provider.
+    """
+
+    base_url: str = Field(min_length=8, max_length=500)
+    model: str = Field(min_length=1, max_length=200)
+    api_key: str = Field(min_length=1, max_length=512)
+    dimensions: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Optional output dimensionality, forwarded to the API for "
+            "models that support truncatable embeddings (e.g. "
+            "text-embedding-3-*). Leave unset to use the model's default."
+        ),
+    )
+    use_for_amem: bool = Field(
+        default=True,
+        description=(
+            "Whether A-MEM may use this entry for its note/query "
+            "embeddings. Default True - opt out per entry if you want to "
+            "reserve it for another feature."
+        ),
+    )
+    use_for_rag: bool = Field(
+        default=True,
+        description=(
+            "Whether RAG may use this entry for document/query embeddings. "
+            "Default True - opt out per entry if you want to reserve it "
+            "for another feature."
+        ),
+    )
+
+
+# ===========================================================================
+# Rerankers
+# ===========================================================================
+
+
+class RerankerConfig(BaseModel):
+    """
+    A single reranker provider entry for a Cohere-compatible ``/rerank``
+    endpoint: ``POST {base_url}/rerank``, header
+    ``Authorization: Bearer {api_key}``, body
+    ``{"model": ..., "query": ..., "documents": [...], "top_n": ...}``,
+    response ``{"results": [{"index": int, "relevance_score": float}, ...]}``.
+
+    `AgentManifest.rerankers` is a feature-agnostic, shared fallback chain -
+    mirrors `models`/`embeds`. Currently only RAG's
+    `RAGRerankerConfig.type == 'cross_encoder'` consumes it, filtered by
+    `use_for_rag`.
+    """
+
+    base_url: str = Field(min_length=8, max_length=500)
+    model: str = Field(min_length=1, max_length=200)
+    api_key: str = Field(
+        min_length=1,
+        max_length=512,
+        description=(
+            "Credential for the Cohere-compatible /rerank API. Not "
+            "excluded from serialisation - see AgentManifest / "
+            "RAGSource.connection_url's docstring for the project-wide "
+            "rationale (manifest = sensitive, gate access via "
+            "AgentPermissions.view_manifest)."
+        ),
+    )
+    use_for_rag: bool = Field(
+        default=True,
+        description=(
+            "Whether RAG's cross_encoder reranker may use this entry. "
+            "Default True - opt out per entry if you want to reserve it "
+            "for another feature."
+        ),
+    )
+
+
+# ===========================================================================
+# RAG - Retrieval-Augmented Generation
 # ===========================================================================
 
 
@@ -741,14 +829,7 @@ class RAGSource(BaseModel):
 
     An agent may declare multiple sources; retrieval requests are issued to
     all of them in parallel and the results are merged by the configured
-    ``RerankerConfig`` before being injected into the context.
-
-    Connection resolution order:
-    1. ``connection_url`` (inline, excluded from serialisation)
-    2. ``connection_url_env`` → ``os.environ[connection_url_env]``
-    3. Environment variable ``RAG_{BACKEND}_URL`` (e.g. ``RAG_QDRANT_URL``)
-    4. For ``backend = 'redis'`` only: fall back to the server-managed Redis
-       client (``common.redis``).
+    ``RAGRerankerConfig`` before being injected into the context.
     """
 
     name: str = Field(
@@ -759,39 +840,29 @@ class RAGSource(BaseModel):
             "Must be unique within the agent's ``rag.sources`` list."
         ),
     )
-    backend: Literal["pgvector", "qdrant", "chroma", "redis"] = Field(
+    backend: Literal["pgvector", "qdrant", "chroma", "redis", "valkey"] = Field(
         description=(
-            "Vector-store backend to query. Each backend requires its own "
-            "Python package to be installed on the server:\n"
-            " - ``'pgvector'``: PostgreSQL + pgvector extension (``asyncpg``).\n"
-            " - ``'qdrant'``: Qdrant vector database (``qdrant-client``).\n"
-            " - ``'chroma'``: ChromaDB (``chromadb``).\n"
-            " - ``'redis'``: Redis Stack with vector-similarity search (``redis``)."
+            "Vector-store backend to query."
         ),
     )
     collection: str = Field(
         description=(
             "Collection, index, or table name inside the backend. Interpretation "
             "is backend-specific: a Qdrant collection name, a pgvector table name, "
-            "a Chroma collection, or a Redis index name."
+            "a Chroma collection, or a Valkey/Redis index name."
         ),
     )
-    connection_url: str | None = Field(
-        default=None,
-        exclude=True,
+    connection_url: str = Field(
+        min_length=1,
         description=(
             "Full connection URL for the backend (e.g. ``postgresql+asyncpg://...``, "
-            "``http://qdrant-host:6333``). Excluded from serialisation — prefer "
-            "``connection_url_env`` to avoid storing credentials in Redis."
-        ),
-    )
-    connection_url_env: str | None = Field(
-        default=None,
-        description=(
-            "Name of a server-side environment variable that holds the connection "
-            "URL. Resolved at retrieval time via ``os.environ[connection_url_env]``. "
-            "Safer than ``connection_url`` because the value never leaves the "
-            "server process."
+            "``http://qdrant-host:6333``, ``redis://...``).\n\n"
+            "NOT excluded from serialisation - like ModelConfig.api_key "
+            "and EmbedConfig.api_key, this is stored and returned as-is. "
+            "Anyone granted AgentPermissions.view_manifest for this agent "
+            "can read it back via GET /agent/{id} - this is intentional, "
+            "so a manifest lost locally can be re-fetched and redeployed "
+            "identically. Restrict view_manifest accordingly."
         ),
     )
     top_k: int = Field(
@@ -809,7 +880,7 @@ class RAGSource(BaseModel):
         le=1.0,
         description=(
             "Minimum cosine-similarity score. Chunks below this threshold are "
-            "discarded before reranking. ``None`` disables score filtering — "
+            "discarded before reranking. ``None`` disables score filtering - "
             "all ``top_k`` results are kept regardless of quality."
         ),
     )
@@ -863,7 +934,7 @@ class RAGSource(BaseModel):
     )
 
 
-class RerankerConfig(BaseModel):
+class RAGRerankerConfig(BaseModel):
     """
     Post-retrieval reranking applied after all ``RAGSource`` results are
     collected. Results from multiple sources are pooled before reranking
@@ -875,19 +946,13 @@ class RerankerConfig(BaseModel):
         description=(
             "Reranking algorithm:\n"
             " - ``'none'``: concatenate in source order, truncate to ``top_n``.\n"
-            " - ``'rrf'``: Reciprocal Rank Fusion — fast, no neural model.\n"
-            " - ``'cross_encoder'``: local cross-encoder model (``sentence-transformers``).\n"
-            " - ``'llm'``: primary LLM acts as a relevance judge. Most accurate "
-            "but expensive."
-        ),
-    )
-    model: str | None = Field(
-        default=None,
-        description=(
-            "Model identifier for ``'cross_encoder'`` and ``'llm'`` rerankers. "
-            "For cross-encoders, a HuggingFace model name "
-            "(e.g. ``'cross-encoder/ms-marco-MiniLM-L-6-v2'``). "
-            "Ignored for ``'rrf'`` and ``'none'``."
+            " - ``'rrf'``: Reciprocal Rank Fusion - fast, no neural models.\n"
+            " - ``'cross_encoder'``: calls a Cohere-compatible ``/rerank`` API "
+            "using ``AgentManifest.rerankers`` entries with ``use_for_rag=True``. "
+            "Requires at least one such entry.\n"
+            " - ``'llm'``: primary LLM acts as a relevance judge, using "
+            "``AgentManifest.models`` entries with ``use_for_rerank=True``. "
+            "Most accurate but expensive."
         ),
     )
     top_n: int = Field(
@@ -925,8 +990,8 @@ class RAGConfig(BaseModel):
             "``enabled = True``."
         ),
     )
-    reranker: RerankerConfig = Field(
-        default_factory=RerankerConfig,
+    reranker: RAGRerankerConfig = Field(
+        default_factory=RAGRerankerConfig,
         description=(
             "Reranking strategy applied after all source results are collected. "
             "Defaults to ``type = 'none'`` (concatenate and truncate)."
@@ -986,7 +1051,7 @@ class NodeCachePolicy(BaseModel):
         description=(
             "Cache entry time-to-live in seconds. After this period the entry "
             "is evicted and the node re-executes on the next request. ``None`` "
-            "means entries never expire — use only for truly static computations."
+            "means entries never expire - use only for truly static computations."
         ),
     )
     key_fields: list[str] | None = Field(
@@ -995,7 +1060,7 @@ class NodeCachePolicy(BaseModel):
             "State field paths included in the cache key. Each entry is a "
             "dot-notation accessor evaluated against the node's input state "
             "(e.g. ``'messages[-1].content'``). ``None`` uses the full "
-            "serialised state hash — safe but may have a lower hit rate when "
+            "serialised state hash - safe but may have a lower hit rate when "
             "irrelevant fields change between requests."
         ),
     )
@@ -1008,25 +1073,15 @@ class CacheConfig(BaseModel):
     Two independent layers are configured here:
 
     1. **Node cache**: LangGraph-level ``CachePolicy`` on individual graph
-       nodes (``rag_retrieval``, ``amem_retrieval``). The shared cache
-       backend is selected via ``backend``.
+       nodes (``rag_retrieval``, ``amem_retrieval``). Backed by a shared
+       Valkey cache on the server - not configurable by the client, since
+       the client has no visibility into the server's storage topology.
 
     2. **Prompt cache**: provider-side prefix caching (Anthropic
        ``cache_control``). The static portion of the system prompt is
        billed at ~10% of the normal input-token rate on cache hits.
     """
 
-    backend: Literal["memory", "sqlite", "redis"] = Field(
-        default="memory",
-        description=(
-            "Storage backend for the LangGraph node cache:\n"
-            " - ``'memory'``: ``InMemoryCache`` — process-local, not shared "
-            "across replicas. Cannot be combined with ``InMemorySaver``.\n"
-            " - ``'sqlite'``: ``SqliteCache`` — file-based, single-process.\n"
-            " - ``'redis'``: ``RedisCache`` — shared across replicas. "
-            "Recommended for production."
-        ),
-    )
     prompt_cache: bool = Field(
         default=False,
         description=(
@@ -1111,47 +1166,31 @@ class ToolRetrieverConfig(BaseModel):
         description=(
             "Cache policy for the ``tool_retriever`` graph node. A cache hit "
             "reuses the previously selected tool set for the same query text "
-            "without re-embedding. ``None`` disables caching — the retriever "
+            "without re-embedding. ``None`` disables caching - the retriever "
             "runs on every request."
         ),
     )
 
 
 # ===========================================================================
-# A-MEM — Agentic Memory
+# A-MEM - Agentic Memory
 # ===========================================================================
 
 
 class AMEMPromptConfig(BaseModel):
     """
-    Prompt configuration for A-MEM note extraction and evolution.
-
-    Overriding the default prompts to
-    tailor memory behaviour to a specific domain.
+    Prompt configuration for the LangMem memory manager used by A-MEM.
     """
 
     note_extraction_prompt: str | None = Field(
         default=None,
         description=(
-            "Override the default note extraction prompt. When ``None``, "
-            "the built-in prompt is used. Must instruct the model to return "
-            "a JSON object with fields: ``insight``, ``entities``, ``tags``, "
-            "``source_summary``. Supports two placeholders:\n"
-            " - ``{dialogue}``: the formatted conversation turns.\n"
-            " - ``{existing_notes}``: recently retrieved notes for "
-            "deduplication context."
-        ),
-    )
-    evolution_prompt: str | None = Field(
-        default=None,
-        description=(
-            "Override the default evolution/conflict-detection prompt. "
-            "When ``None``, the built-in prompt is used. Must instruct the "
-            "model to return a JSON object with fields: ``relationship``, "
-            "``should_update_existing``, ``updated_insight``, ``explanation``. "
-            "Supports two placeholders:\n"
-            " - ``{new_insight}``: the newly extracted note insight.\n"
-            " - ``{existing_insight}``: the existing note insight being compared."
+            "Override the default extraction instructions passed to LangMem's "
+            "``create_memory_manager`` as ``instructions``. Unlike the old "
+            "custom prompt, this is guidance text only - no ``{dialogue}`` / "
+            "``{existing_notes}`` placeholders are supported; LangMem builds "
+            "the full prompt internally from the conversation and the "
+            "``existing`` memories passed at call time."
         ),
     )
 
@@ -1162,7 +1201,7 @@ class AMEMConfig(BaseModel):
 
     A-MEM builds a persistent knowledge graph on top of the standard rolling
     summary. After each agent response, an LLM analyses the exchange and
-    produces a structured note — a concise insight with entities, tags, and
+    produces a structured note - a concise insight with entities, tags, and
     links to related past notes.
 
     Unlike the rolling summary (linear compression of recent history), A-MEM
@@ -1177,12 +1216,13 @@ class AMEMConfig(BaseModel):
             "performed and the ``{amem}`` placeholder expands to an empty string."
         ),
     )
-    graph_backend: Literal["redis", "neo4j", "in_memory"] = Field(
-        default="redis",
+    graph_backend: Literal["valkey", "redis", "neo4j", "in_memory"] = Field(
+        default="valkey",
         description=(
             "Storage backend for the knowledge graph:\n"
-            " - ``'redis'``: Redis Stack with vector-similarity search. "
-            "Recommended — no extra infrastructure if Redis is already in use.\n"
+            " - ``'valkey'`` and ``'redis'``: vector-similarity search. "
+            "RediSearch or valkey-search is required.\n"
+            "Recommended - no extra infrastructure if Valkey or Redis is already in use.\n"
             " - ``'neo4j'``: native graph database. Better for complex "
             "multi-hop relationship queries.\n"
             " - ``'in_memory'``: ephemeral dict-based store. Notes are lost "
@@ -1191,19 +1231,18 @@ class AMEMConfig(BaseModel):
     )
     connection_url: str | None = Field(
         default=None,
-        exclude=True,
         description=(
-            "Connection URL for the A-MEM backend (e.g. ``redis://...``, "
-            "``bolt://neo4j:7687``). Excluded from serialisation. When "
-            "``None`` and ``graph_backend = 'redis'``, the server-managed "
-            "Redis client is used."
-        ),
-    )
-    connection_url_env: str | None = Field(
-        default=None,
-        description=(
-            "Name of a server-side environment variable holding the connection "
-            "URL. Resolved at runtime via ``os.environ[connection_url_env]``."
+            "Connection URL for the A-MEM backend (e.g. ``valkey://...``, "
+            "``bolt://neo4j:7687``). When ``None`` and "
+            "``graph_backend = 'valkey'``, the server-managed Valkey client "
+            "is used - unlike RAGSource, this "
+            "fallback is intentional here: A-MEM's own note index is "
+            "namespaced by scope (see AMEMConfig.scope) and safely "
+            "coexists with the rest of the server's Valkey usage.\n\n"
+            "NOT excluded from serialisation - see RAGSource.connection_url's "
+            "docstring for the rationale shared across this and all "
+            "credential-bearing fields (ModelConfig.api_key, "
+            "EmbedConfig.api_key, RerankerConfig.api_key)."
         ),
     )
     write_mode: Literal["async", "blocking", "disabled"] = Field(
@@ -1241,11 +1280,10 @@ class AMEMConfig(BaseModel):
     evolution: bool = Field(
         default=True,
         description=(
-            "When ``True``, existing notes that are contradicted or superseded "
-            "by a new note are updated in place. The LLM compares the new "
-            "insight against similar existing notes and performs an upsert "
-            "when a conflict is detected. Disable if immutability of past "
-            "notes is required."
+            "When True, the LangMem memory manager is allowed to update "
+            "existing notes that are contradicted or superseded by new "
+            "information (mapped to LangMem's enable_updates). When False, "
+            "existing notes are immutable and only new notes are ever created."
         ),
     )
     retrieval_top_k: int = Field(
@@ -1265,59 +1303,58 @@ class AMEMConfig(BaseModel):
             "name conflicts with another placeholder."
         ),
     )
-    evolution_similarity_threshold: float = Field(
-        default=0.75,
-        ge=0.0,
-        le=1.0,
-        description=(
-            "Minimum cosine similarity score required before running the "
-            "evolution LLM call against an existing note. Notes below this "
-            "threshold are considered unrelated and skipped. Prevents "
-            "spurious updates from weakly related notes. Range: 0.0–1.0."
-        ),
-    )
     scope: Literal[
+        "session",
+        "session_user",
         "thread",
         "thread_user",
         "agent",
         "agent_user",
-        "system_agent",
-        "system_agent_user",
-        "system_thread",
-        "system_thread_user",
+        "group",
+        "group_user",
     ] = Field(
-        default="thread",
+        default="session",
         description=(
             "Visibility scope of the A-MEM knowledge graph. Controls which "
             "namespace notes are written to and read from.\n\n"
-            " - ``'thread'``: notes are private to the current ``session_id``. "
-            "Each conversation starts with clean memory.\n"
-            " - ``'thread_user'``: notes are scoped to both ``session_id`` and "
-            "``user_id``. Adds explicit user isolation on top of thread isolation.\n"
-            " - ``'agent'``: notes are shared across all users and all threads "
-            "of this agent. Use for shared knowledge bases and FAQ accumulation.\n"
-            " - ``'agent_user'``: notes are shared across all threads of this "
-            "agent for the same user, isolated from other users. Recommended "
-            "scope for personal assistants — the user carries memory into every "
-            "new conversation.\n"
-            " - ``'system_agent'``: notes are shared across all agents in this "
-            "multi-agent system (identified by ``root_agent_id``) across all "
-            "users and threads. All supervisor and worker agents share one pool.\n"
-            " - ``'system_agent_user'``: same as ``'system_agent'`` but isolated "
-            "per user. All agents in the system share memory for a given user, "
-            "other users are isolated.\n"
-            " - ``'system_thread'``: notes are shared across all agents in this "
-            "multi-agent system within a single root conversation (identified by "
-            "``root_thread_id``). Different conversations are isolated.\n"
-            " - ``'system_thread_user'``: same as ``'system_thread'`` but with "
-            "additional user isolation on top of root thread isolation."
+            " - ``'session'``: notes are private to the current graph node "
+            "(root agent or a specific sub-agent's own thread_id). Each "
+            "sub-agent has its own isolated memory even within the same root "
+            "thread.\n"
+            " - ``'session_user'``: same as ``'session'`` with additional "
+            "``user_id`` isolation.\n"
+            " - ``'thread'``: notes are shared across the whole root "
+            "conversation - the root agent and all of its sub-agents, "
+            "identified by ``root_thread_id``. Different root threads are "
+            "isolated.\n"
+            " - ``'thread_user'``: same as ``'thread'`` with additional "
+            "``user_id`` isolation.\n"
+            " - ``'agent'``: notes are shared across every thread deployed "
+            "from the same source agent template, identified by the thread's "
+            "``source_agent_id``. Threads that started from an independently "
+            "supplied manifest (no source agent) cannot use this scope.\n"
+            " - ``'agent_user'``: same as ``'agent'`` with additional "
+            "``user_id`` isolation.\n"
+            " - ``'group'``: notes are shared across an arbitrary set of "
+            "threads/agents that all set the same ``group_key``. Requires "
+            "``group_key`` to be set.\n"
+            " - ``'group_user'``: same as ``'group'`` with additional "
+            "``user_id`` isolation."
         ),
     )
-    model: ModelConfig = Field(
-        default_factory=ModelConfig,
+    group_key: str | None = Field(
+        default=None,
+        min_length=8,
         description=(
-            "Model configuration for A-MEM LLM calls. "
-            "Controls which model is used for note extraction and evolution."
+            "Arbitrary shared identifier used when `scope` is 'group' or "
+            "'group_user'. Any thread or agent whose manifest sets the same "
+            "group_key reads and writes the same A-MEM namespace.\n\n"
+            "There is no separate access control on group membership - knowing "
+            "the key is equivalent to having access to the shared notes. Avoid "
+            "short or guessable values like 'cat' or 'team1'; prefer an "
+            "unguessable value (e.g. a UUID) if the group's contents are "
+            "sensitive or if this manifest may be visible to users who "
+            "shouldn't be able to join the group by reusing the key elsewhere."
         ),
     )
     prompt: AMEMPromptConfig = Field(
@@ -1328,6 +1365,14 @@ class AMEMConfig(BaseModel):
         ),
     )
 
+    @model_validator(mode="after")
+    def validate_group_key(self):
+        if self.scope in ("group", "group_user") and not self.group_key:
+            raise ValueError(
+                "AMEMConfig.scope='group'/'group_user' requires group_key to be set."
+            )
+        return self
+
 
 # ===========================================================================
 # Memory
@@ -1336,31 +1381,48 @@ class AMEMConfig(BaseModel):
 
 class MemoryConfig(BaseModel):
     """
-    Persistent memory configuration combining rolling summary and A-MEM.
+    Three independent memory layers, combinable in any valid configuration:
 
-    **Rolling summary** (``summarization`` + ``threshold`` + ``keep_last``):
-    A compact linear digest of older turns. When the message count exceeds
-    ``threshold``, oldest turns are trimmed; if ``summarization != 'disabled'``,
-    an LLM produces a summary stored in ``SummaryStore`` and injected via
-    ``{summary}``.
+    **Checkpointing** (`checkpointing`): LangGraph checkpoint persistence -
+    whether `messages` state is saved and restored between turns ("regular
+    memory"). This is the only layer that gives conversation continuity
+    within a thread.
 
-    **A-MEM** (``agentic``): A persistent cross-session knowledge graph.
-    Operates independently of the rolling summary — they complement each
-    other: summary provides recency, A-MEM provides depth.
+    **Rolling summary** (`summarization` + `threshold` + `keep_last`):
+    a compact linear digest of older turns, computed by trimming the
+    *persisted* checkpoint history. Requires `checkpointing=True` - there is
+    nothing to trim/summarize without persisted history.
+
+    **A-MEM** (`agentic`): a persistent cross-session knowledge graph.
+    Independent of `checkpointing` - A-MEM extracts a note from the current
+    exchange (the Human/AI messages passed into this graph invocation),
+    which is available regardless of whether the checkpointer is attached.
     """
 
-    enabled: bool = Field(
+    checkpointing: bool = Field(
         default=True,
         description=(
-            "Master switch for persistent memory. When ``False``, the agent is "
-            "fully stateless: no checkpoint is written, no summary is maintained, "
-            "and A-MEM is suppressed regardless of ``agentic.enabled``."
+            "Master switch for LangGraph checkpoint persistence ('regular "
+            "memory') - whether conversation state is saved to the database "
+            "and restored between separate turns (separate user messages).\n\n"
+            "When False: each new user message starts the graph from a clean "
+            "state, so earlier turns are not visible to the LLM. This does NOT "
+            "affect anything within a single turn - a tool-calling cycle "
+            "(user message -> tool call -> tool result -> final answer) still "
+            "flows correctly through the graph's own state channels, since "
+            "that doesn't depend on the checkpointer at all; only cross-turn "
+            "continuity is lost. `summarization` requires this to be True (see "
+            "its own field). `agentic.enabled` (A-MEM) is unaffected either "
+            "way - A-MEM's note extraction only needs the current turn's "
+            "exchange, not persisted history."
         ),
     )
     summarization: Literal["async", "blocking", "disabled"] = Field(
         default="disabled",
         description=(
-            "LLM-based summarisation strategy after each response:\n"
+            "LLM-based summarisation strategy after each response. Requires "
+            "`checkpointing=True` - trimming/summarizing operates on the "
+            "persisted checkpoint history, which doesn't exist otherwise.\n"
             " - ``'disabled'``: old messages are trimmed but no summary is "
             "generated. Context beyond ``keep_last`` turns is lost.\n"
             " - ``'async'``: fire-and-forget background task. The next "
@@ -1369,42 +1431,53 @@ class MemoryConfig(BaseModel):
             "processing lock. Guarantees freshness but adds latency."
         ),
     )
-    threshold: int = Field(
-        default=6,
-        ge=2,
-        description=(
-            "Number of conversation turns (counted by HumanMessage boundaries) "
-            "that must accumulate before trimming and optional summarisation "
-            "are triggered."
-        ),
-    )
+    threshold: int = Field(default=6, ge=2, description=(
+        "Number of conversation turns (counted by HumanMessage boundaries) "
+        "that must accumulate before trimming and optional summarisation "
+        "are triggered. Only meaningful when `checkpointing=True`."
+    ))
     keep_last: int = Field(
         default=3,
         ge=1,
         description=(
             "Number of most recent turns preserved verbatim after trimming. "
-            "These turns remain fully visible to the LLM. Must be strictly "
-            "less than ``threshold``."
+            "Must be strictly less than `threshold`. Only meaningful when "
+            "`checkpointing=True`.\n\n"
+            "The minimum possible window is threshold=2, keep_last=1 - "
+            "summarization cannot be pushed further toward zero verbatim "
+            "history, since it operates on messages that must first exist in "
+            "the checkpoint (i.e. persisted via `checkpointing=True`) before "
+            "they can be trimmed/summarized. If you want no verbatim history "
+            "between turns at all, set `checkpointing=False` and "
+            "`summarization='disabled'`, and rely on `agentic` (A-MEM) alone "
+            "for cross-turn recall - A-MEM does not depend on checkpointing."
         ),
     )
     agentic: AMEMConfig = Field(
         default_factory=AMEMConfig,
         description=(
-            "A-MEM knowledge-graph settings. Operates as a separate memory "
-            "layer on top of the rolling summary. Requires "
-            "``memory.enabled = True``."
+            "A-MEM knowledge-graph settings. Fully independent of "
+            "`checkpointing`/`summarization` - may be enabled on its own, "
+            "alongside either or both of the other layers, or not at all."
         ),
     )
 
     @model_validator(mode="after")
-    def validate_keep_last(self):
+    def validate_memory_combination(self):
         if self.keep_last >= self.threshold:
             raise ValueError(
                 f"keep_last ({self.keep_last}) must be strictly less than "
                 f"threshold ({self.threshold})."
             )
-        if self.agentic.enabled and not self.enabled:
-            raise ValueError("agentic.enabled=True requires memory.enabled=True.")
+        if self.summarization != "disabled" and not self.checkpointing:
+            raise ValueError(
+                "memory.summarization != 'disabled' requires "
+                "memory.checkpointing=True - without the LangGraph "
+                "checkpointer there is no persisted message history to "
+                "trim or summarize. Set checkpointing=True, or leave "
+                "summarization='disabled' if you only want A-MEM "
+                "(agentic.enabled) and/or no memory at all."
+            )
         return self
 
 
@@ -1461,7 +1534,7 @@ class TriggerConfig(BaseModel):
 class ToolCallRetryPolicy(BaseModel):
     """
     Recovery policy for tool-calling failures that happen *before* the LLM
-    produces a valid AIMessage with tool_calls — i.e. provider-side schema
+    produces a valid AIMessage with tool_calls - i.e. provider-side schema
     validation errors, malformed function-call JSON, etc. Distinct from a
     tool that executed and returned an error (that already round-trips
     through a normal ToolMessage and needs no special handling here).
@@ -1483,12 +1556,12 @@ class ToolCallRetryPolicy(BaseModel):
     inject_feedback: bool = Field(
         default=True,
         description="Append a corrective message describing exactly what was "
-                     "wrong (tool name, bad field, expected type) so the model "
+                     "wrong (tool name, bad field, expected type) so the models "
                      "can self-correct instead of blindly repeating the same call.",
     )
     max_consecutive_tool_errors: int = Field(
         default=3, ge=1,
-        description="Separate loop-guard: if the model keeps calling a tool "
+        description="Separate loop-guard: if the models keeps calling a tool "
                      "and getting back *executed* ToolMessage errors this many "
                      "times in a row (schema is fine, tool logic/args are just "
                      "wrong), stop looping and surface a graceful final answer "
@@ -1511,7 +1584,7 @@ class ToolParam(BaseModel):
         default=None,
         description=(
             "Human-readable description shown to the LLM. Omitting this "
-            "reduces the model's ability to supply correct values."
+            "reduces the models's ability to supply correct values."
         ),
     )
     default: Any = Field(
@@ -1545,7 +1618,7 @@ class ToolConfig(BaseModel):
 
     name: str = Field(
         description=(
-            "Tool identifier — must be unique within the agent. Used as the "
+            "Tool identifier - must be unique within the agent. Used as the "
             "function name exposed to the LLM in the tools JSON Schema."
         ),
     )
@@ -1561,7 +1634,7 @@ class ToolConfig(BaseModel):
         default=None,
         description=(
             "Explanation shown to the LLM describing what the tool does and "
-            "when to use it. Critical for correct tool selection — keep it "
+            "when to use it. Critical for correct tool selection - keep it "
             "concise and action-oriented."
         ),
     )
@@ -1569,7 +1642,7 @@ class ToolConfig(BaseModel):
         default_factory=dict,
         description=(
             "Named parameters the tool accepts. Compiled into a Pydantic "
-            "model at runtime so LangChain can generate the correct JSON Schema."
+            "models at runtime so LangChain can generate the correct JSON Schema."
         ),
     )
     timeout: int = Field(
@@ -1595,7 +1668,7 @@ class ToolConfig(BaseModel):
             "When ``mode='disabled'`` (default), the call is delivered only to "
             "the connection that triggered the current agent run.\n\n"
             "When any other mode is set, the call is published to all connections "
-            "on this ``session_id`` across all pods via Redis pub/sub, and responses "
+            "on this ``session_id`` across all pods via Valkey pub/sub, and responses "
             "are aggregated according to the configured strategy.\n\n"
             "See ``BroadcastConfig`` and ``BroadcastMode`` for full details."
         ),
@@ -1614,7 +1687,7 @@ class ToolConfig(BaseModel):
 
 
 # ===========================================================================
-# Components — peripheral I/O
+# Components - peripheral I/O
 # ===========================================================================
 
 
@@ -1622,13 +1695,13 @@ class TTSConfig(BaseModel):
     """
     Text-to-Speech synthesis parameters for the Piper TTS engine.
 
-    All fields are optional overrides of the Piper model's built-in defaults.
-    TTS is activated by setting ``voice`` to a valid Piper voice model name.
+    All fields are optional overrides of the Piper models's built-in defaults.
+    TTS is activated by setting ``voice`` to a valid Piper voice models name.
     """
 
     voice: str | None = Field(
         default=None,
-        description="Piper voice model name from the official registry.",
+        description="Piper voice models name from the official registry.",
     )
     speaker_id: int | None = Field(
         default=None,
@@ -1660,7 +1733,7 @@ class Components(BaseModel):
     """
     Optional peripheral components attached to the agent.
 
-    Only configure what the agent actually uses — unused components have
+    Only configure what the agent actually uses - unused components have
     no runtime cost.
     """
 
@@ -1704,7 +1777,7 @@ def _normalize_tool_entry(t: Any) -> list[ToolConfig]:
 
 
 # ===========================================================================
-# AgentManifest — root model
+# AgentManifest - root models
 # ===========================================================================
 
 
@@ -1713,12 +1786,21 @@ class AgentManifest(BaseModel):
     Complete declarative description of an agent and its capabilities.
 
     The manifest is the single source of truth for how an agent behaves.
-    It is submitted via ``POST /agent/deploy/{session_id}``, serialised to
-    Redis, and used by ``AgentFactory`` to compile a LangGraph graph.
 
-    Sub-agents are fully recursive — each element of ``sub_agents`` is itself
+    Sub-agents are fully recursive - each element of ``sub_agents`` is itself
     an ``AgentManifest`` deployed independently with
     ``session_id = '{parent}_{sub.id}'``.
+
+    Sensitive fields (credentials)
+    -------------------------------
+    Fields carrying credentials (ModelConfig.api_key, EmbedConfig.api_key,
+    RerankerConfig.api_key, RAGSource.connection_url) are stored and
+    returned as-is - none are excluded from serialisation. Access is
+    gated exclusively through AgentPermissions.view_manifest (default
+    owner_only), not through field-level redaction. This lets an owner
+    who lost their local copy of a manifest re-fetch and redeploy it
+    identically via GET /agent/{id}. Restrict view_manifest to whitelist/
+    owner_only for any agent whose manifest carries production credentials.
     """
 
     model_config = {"arbitrary_types_allowed": True}
@@ -1738,8 +1820,7 @@ class AgentManifest(BaseModel):
             "``{time}``, ``{summary}``, ``{amem}``, ``{rag_<name>}`` "
             "placeholders. ``{summary}`` requires ``memory.summarization`` "
             "set to ``'async'`` or ``'blocking'`` (not just "
-            "``memory.enabled``). Unknown placeholders produce an inline "
-            "``memory.enabled``). Unknown placeholders produce an inline "
+            "``memory.checkpointing``). Unknown placeholders produce an inline "
             "error note instead of crashing."
         ),
     )
@@ -1750,34 +1831,52 @@ class AgentManifest(BaseModel):
             "mode and any mode-specific settings."
         )
     )
-    model: list[ModelConfig] = Field(
+    embeds: list[EmbedConfig] = Field(
         default_factory=list,
-        max_length=10,
+        max_length=50,
+        description=(
+            "Ordered fallback chain of embedding providers, shared across "
+            "any feature on this agent that needs vector embeddings (A-MEM, "
+            "RAG, ...). Each feature filters this list by its own "
+            "`use_for_*` flag on EmbedConfig rather than owning a private "
+            "chain."
+        ),
+    )
+    rerankers: list[RerankerConfig] = Field(
+        default_factory=list,
+        description=(
+            "Ordered fallback chain of reranker providers (Cohere-compatible "
+            "`/rerank` API), shared across any feature that needs reranking. "
+            "RAG's `reranker.type='cross_encoder'` filters this list by "
+            "`use_for_rag=True`."
+        ),
+    )
+    models: list[ModelConfig] = Field(
+        default_factory=list,
+        max_length=50,
         description=(
             "Ordered fallback chain of LLM configurations for this agent. "
             "The first entry is tried first; if the call to it fails "
-            "(connection error, provider error, etc. — but not after "
+            "(connection error, provider error, etc. - but not after "
             "streaming has already started, to avoid mixed output), the "
             "next entry is tried, and so on. This chain is isolated per "
-            "agent/sub-agent — it shares no state with other agents. An "
-            "entry that omits base_url/model/api_key falls back to the "
-            "server's global provider pool (shared, distributed rotation "
-            "across all such entries system-wide), using that entry's "
-            "sampling/reasoning parameters.\n\n"
+            "agent/sub-agent - it shares no state with other agents. Every "
+            "entry must fully specify base_url, model, and api_key.\n\n"
             "May be left empty (the default) ONLY when "
-            "model_rotation.allow_client_override=True — in that case every "
+            "model_rotation.allow_client_override=True - in that case every "
             "connecting client is required to supply its own chain via the "
             "'set_models' WebSocket event before its first message, and the "
-            "server never falls back to a default chain. Leaving this empty "
+            "agent has no chain to use until it does. Leaving this empty "
             "with allow_client_override=False is a configuration error, "
-            "since the agent would then have no way to obtain a model at all."
+            "since the agent would then have no way to obtain a models chain "
+            "at all."
         ),
     )
     model_rotation: ModelRotationPolicy = Field(
         default_factory=ModelRotationPolicy,
         description=(
-            "Controls sharing/isolation of model fallback progress across "
-            "connections, and whether clients may override the model chain "
+            "Controls sharing/isolation of models fallback progress across "
+            "connections, and whether clients may override the models chain "
             "entirely. See ModelRotationPolicy for details."
         ),
     )
@@ -1797,7 +1896,7 @@ class AgentManifest(BaseModel):
         default_factory=ToolRetrieverConfig,
         description=(
             "Dynamic tool selection via semantic retrieval. Disabled by "
-            "default — all tools are sent on every call."
+            "default - all tools are sent on every call."
         ),
     )
     inherit_tools_from: list[str] = Field(
@@ -1818,7 +1917,7 @@ class AgentManifest(BaseModel):
             "and tool inheritance. Sub-agents are deployed independently with "
             "``session_id = '{parent_thread_id}_{sub.id}'`` and are addressable "
             "by that ID. The parent agent does NOT delegate to sub-agents "
-            "automatically — delegation is an explicit, opt-in pattern: register "
+            "automatically - delegation is an explicit, opt-in pattern: register "
             "a dedicated server tool such as ``send_task_to_{sub.id}`` that "
             "invokes the sub-agent's thread over HTTP/WebSocket and returns its "
             "response. Grouping agents here is primarily useful for "
@@ -1831,7 +1930,7 @@ class AgentManifest(BaseModel):
         description=(
             "Tools available to this agent. Accepts ``ToolConfig`` instances, "
             "raw dicts, ``@tool``-decorated callables, and ``ToolBelt`` "
-            "instances — a ``ToolBelt`` is flattened into its member tools, "
+            "instances - a ``ToolBelt`` is flattened into its member tools, "
             "so passing one is equivalent to listing each of its tools "
             "individually."
         ),
@@ -1840,17 +1939,17 @@ class AgentManifest(BaseModel):
         default_factory=ToolCallRetryPolicy,
         description=(
             "Recovery policy for tool-calling failures that happen *before* a tool "
-            "actually executes — the provider rejected the LLM's function-call "
+            "actually executes - the provider rejected the LLM's function-call "
             "arguments against the tool's JSON Schema (malformed/mistyped args, an "
             "explicit null where the provider doesn't allow it, etc.). Distinct from "
             "a tool that executed and returned an error string: that case already "
             "round-trips through a normal ToolMessage and the LLM can self-correct "
-            "on its own next turn — no special handling needed here.\n\n"
-            "On a retryable validation failure, the *same* model that failed is "
-            "re-invoked (not the next entry in the ``model`` fallback chain) with a "
+            "on its own next turn - no special handling needed here.\n\n"
+            "On a retryable validation failure, the *same* models that failed is "
+            "re-invoked (not the next entry in the ``models`` fallback chain) with a "
             "corrective system message, up to ``max_retries`` times. Falling over to "
-            "the next model in ``model`` is reserved for genuine provider/connection "
-            "failures — a schema-validation error never counts against provider "
+            "the next models in ``models`` is reserved for genuine provider/connection "
+            "failures - a schema-validation error never counts against provider "
             "health and never triggers rotation. If retries are exhausted, the agent "
             "responds with a graceful message instead of raising a 500.\n\n"
             "Can be overridden per tool via ``ToolConfig.retry``; ``None`` there "
@@ -1880,7 +1979,7 @@ class AgentManifest(BaseModel):
         description=(
             "Access control settings for this agent. Controls who can view the manifest, "
             "create threads, deploy new versions, and delete the agent.\n\n"
-            "Only applicable to root agents — sub-agents inherit the root agent's "
+            "Only applicable to root agents - sub-agents inherit the root agent's "
             "deployment context and cannot have independent permissions. "
             "Specifying 'permissions' on a sub-agent raises a validation error."
         ),
@@ -1901,18 +2000,85 @@ class AgentManifest(BaseModel):
         return result
 
     @model_validator(mode="after")
+    def validate_amem_has_usable_models(self):
+        """
+        A-MEM must never silently borrow the server's default provider pool
+        for its own extraction/evolution LLM calls - it only ever uses
+        entries explicitly opted in via ModelConfig.use_for_amem. When the
+        chain is fully known at manifest-deploy time (i.e. not deferred
+        entirely to a client override), validate it here so a
+        misconfiguration is caught at deploy time instead of failing every
+        A-MEM write() at runtime. When `models` is empty and a client
+        override is required, the equivalent check happens per-connection
+        when the client sends 'set_models' (see agents.py).
+        """
+        amem_enabled = self.memory.checkpointing and self.memory.agentic.enabled
+        if amem_enabled and self.models and not any(m.use_for_amem for m in self.models):
+            raise ValueError(
+                "memory.agentic.enabled=True requires at least one entry in "
+                "`models` with use_for_amem=True - A-MEM does not use the "
+                "server's default provider pool. Mark one or more entries "
+                "in `models` with use_for_amem=True, or disable "
+                "memory.agentic."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_rag_reranker_has_usable_providers(self):
+        """
+        Mirrors validate_amem_has_usable_models / validate_embeds_for_
+        enabled_features: RAG must not silently fall back to an implicit
+        provider for its reranker. When `models` is empty and everything
+        is deferred to a client override, the equivalent 'llm' check is
+        deferred to 'set_models' time (not implemented here, same as A-MEM's
+        note in agents.py) - only validated eagerly when `models` is known.
+        """
+        if not self.rag.enabled:
+            return self
+        rtype = self.rag.reranker.type
+        if rtype == "cross_encoder" and not any(r.use_for_rag for r in self.rerankers):
+            raise ValueError(
+                "rag.reranker.type='cross_encoder' requires at least one "
+                "entry in `rerankers` with use_for_rag=True."
+            )
+        if rtype == "llm" and self.models and not any(
+            m.use_for_rerank for m in self.models
+        ):
+            raise ValueError(
+                "rag.reranker.type='llm' requires at least one entry in "
+                "`models` with use_for_rerank=True."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_embeds_for_enabled_features(self):
+        amem_enabled = self.memory.checkpointing and self.memory.agentic.enabled
+        if amem_enabled and not any(e.use_for_amem for e in self.embeds):
+            raise ValueError(
+                "memory.agentic.enabled=True requires at least one entry in "
+                "`embeds` with use_for_amem=True - A-MEM does not fall back "
+                "to an implicit default embedding provider."
+            )
+        if self.rag.enabled and not any(e.use_for_rag for e in self.embeds):
+            raise ValueError(
+                "rag.enabled=True requires at least one entry in `embeds` "
+                "with use_for_rag=True."
+            )
+        return self
+
+    @model_validator(mode="after")
     def validate_model_chain_or_override(self):
         """
-        `model` may only be empty when the manifest explicitly delegates
-        model selection to connecting clients — otherwise there would be no
+        `models` may only be empty when the manifest explicitly delegates
+        models selection to connecting clients - otherwise there would be no
         way to ever obtain an LLM for this agent.
         """
-        if not self.model and not self.model_rotation.allow_client_override:
+        if not self.models and not self.model_rotation.allow_client_override:
             raise ValueError(
-                "AgentManifest.model is empty and "
-                "model_rotation.allow_client_override is False — this agent "
-                "has no way to obtain a model chain. Either provide at least "
-                "one ModelConfig in `model`, or set "
+                "AgentManifest.models is empty and "
+                "model_rotation.allow_client_override is False - this agent "
+                "has no way to obtain a models chain. Either provide at least "
+                "one ModelConfig in `models`, or set "
                 "model_rotation.allow_client_override=True so clients can "
                 "supply their own chain via the 'set_models' WS event."
             )
@@ -1926,7 +2092,7 @@ class AgentManifest(BaseModel):
             if t.name in seen_names:
                 raise ValueError(
                     f"Duplicate tool name '{t.name}' after flattening "
-                    f"ToolBelt(s)/tool list — tool names must be unique "
+                    f"ToolBelt(s)/tool list - tool names must be unique "
                     f"within an agent."
                 )
             seen_names.add(t.name)
