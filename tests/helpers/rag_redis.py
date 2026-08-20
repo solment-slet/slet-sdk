@@ -51,11 +51,11 @@ async def seed_redis_rag_source(
     embed_api_key: str,
     extra_tag_fields: list[str] | None = None,
 ) -> None:
-    """Creates a RediSearch index named `{collection}:idx` (matching
-    RAGSource.collection -> `f"{namespace}:idx"` used by _RedisBackend) and
-    stores `documents`, each embedded and tagged with `namespace`."""
+    """Creates a RediSearch index named `{collection}` (RAGSource.collection
+    IS the index name for backend='redis'/'valkey' - see RAGSource.collection
+    docstring) and stores `documents`, each embedded and tagged with `namespace`."""
     client = Redis.from_url(redis_url)
-    idx_name = f"{collection}:idx"
+    idx_name = collection
 
     vectors = await embed_texts(embed_base_url, embed_model, embed_api_key, documents)
     dim = len(vectors[0])
@@ -91,7 +91,7 @@ async def seed_redis_rag_source(
 
 async def drop_redis_rag_source(redis_url: str, collection: str) -> None:
     client = Redis.from_url(redis_url)
-    idx_name = f"{collection}:idx"
+    idx_name = collection
     try:
         await client.ft(idx_name).dropindex(delete_documents=True)
     except Exception:

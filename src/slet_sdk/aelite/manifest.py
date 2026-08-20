@@ -849,7 +849,10 @@ class RAGSource(BaseModel):
         description=(
             "Collection, index, or table name inside the backend. Interpretation "
             "is backend-specific: a Qdrant collection name, a pgvector table name, "
-            "a Chroma collection, or a Valkey/Redis index name."
+            "a Chroma collection, or a Valkey/Redis index name.\n\n"
+            "For backend='redis'/'valkey': this is the exact RediSearch index name "
+            "passed to FT.SEARCH - do not add extra suffixes (e.g. ':idx'); the "
+            "index must be created under this literal name."
         ),
     )
     connection_url: str = Field(
