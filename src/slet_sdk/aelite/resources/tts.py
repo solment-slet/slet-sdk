@@ -10,9 +10,6 @@ from websockets.asyncio.connection import Connection
 
 from slet_sdk.aelite.manifest import TTSConfig
 
-# URL для TTS WS
-GATEWAY_URL = "ws://localhost:8000/ae/tts/ws"
-
 
 class TTSResource(BaseResource):
     async def stream_tts(
@@ -39,7 +36,7 @@ class TTSResource(BaseResource):
             ConnectionClosed: Если сервер разорвал соединение.
             Exception: При ошибках внутри WebSocket.
         """
-        url = f"{self.base_ws_url}"
+        url = f"{self.base_ws_url}/tts/ws"
 
         # Конфигурация сессии
         session_config = tts_config.model_dump()
@@ -93,7 +90,7 @@ class TTSResource(BaseResource):
                             event = json.loads(msg)
 
                             if event.get("event") == "done":
-                                # Сервер подтвердил, что синтез полностью завершен
+                                # Сервер подтвердил, что синтез полностью, завершен
                                 break
 
                             if event.get("event") == "error":
