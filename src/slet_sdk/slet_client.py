@@ -3,7 +3,7 @@ from __future__ import annotations
 import httpx
 import json
 import logging
-from typing import Any
+from typing import Any, TypeVar
 from datetime import date, datetime
 from decimal import Decimal
 from uuid import UUID
@@ -23,6 +23,9 @@ from slet_sdk.schemas.auth import (
 from slet_sdk.aelite.resources.resource import AeliteResource
 from slet_sdk.typing import LoggerLike, WebsocketsModule
 from slet_sdk.config import ApiPrefixes
+
+
+T = TypeVar('T', bound=BaseModel)
 
 
 class SletClient:
@@ -96,7 +99,7 @@ class SletClient:
             )
         return {"Authorization": f"Bearer {self.access_token}"}
 
-    async def request[T: BaseModel](
+    async def request(
         self,
         method: str,
         url: str,
@@ -107,7 +110,7 @@ class SletClient:
     ) -> dict | T | None:
         return await self._request_impl(method, url, schema=schema, body=body, **kwargs)
 
-    async def _request_impl[T: BaseModel](
+    async def _request_impl(:
         self,
         method: str,
         url: str,
@@ -232,7 +235,7 @@ class SletClient:
                 )
             )
 
-    def _validate_schema[T: BaseModel](
+    def _validate_schema(
         self,
         data: dict,
         schema: type[T],
