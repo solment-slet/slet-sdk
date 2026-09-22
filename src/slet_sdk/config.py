@@ -5,6 +5,7 @@ from dataclasses import dataclass, fields
 class ApiPrefixes:
     identify: str = "identify/v1"
     aelite: str = "aelite/v1"
+    ocr: str = "ocr"
 
     def __post_init__(self) -> None:
         for field in fields(self):

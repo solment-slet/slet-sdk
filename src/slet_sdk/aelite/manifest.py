@@ -32,7 +32,7 @@ Unknown placeholders produce an inline error note instead of crashing.
 from __future__ import annotations
 
 from typing import Any, Literal, Annotated, Callable
-from enum import StrEnum, Enum
+from enum import Enum
 
 from pydantic import BaseModel, Field, model_validator, field_validator
 
@@ -120,7 +120,7 @@ class AgentPermissions(BaseModel):
 # ===========================================================================
 
 
-class SequentialTimeoutPolicy(StrEnum):
+class SequentialTimeoutPolicy(str, Enum):
     ignore = "ignore"                # processing_timeout is ignored
     release_lock = "release_lock"    # the lock is released and the following request is executed
     cancel = "cancel"                # request is canceled
@@ -189,7 +189,7 @@ class ConcurrencyConfig(BaseModel):
 # ===========================================================================
 
 
-class MCPResourceMode(StrEnum):
+class MCPResourceMode(str, Enum):
     """
     Defines how MCP server resources are exposed to the agent.
 
@@ -367,7 +367,7 @@ class MCPServerConfig(BaseModel):
 # ===========================================================================
 
 
-class BroadcastMode(StrEnum):
+class BroadcastMode(str, Enum):
     """
     Determines how the server collects responses from connected WebSocket
     clients when a client tool is invoked in broadcast mode.
@@ -491,7 +491,7 @@ class BroadcastConfig(BaseModel):
 # ===========================================================================
 
 
-class ProviderKind(StrEnum):
+class ProviderKind(str, Enum):
     OPENAI_COMPATIBLE = "openai_compatible"
     ANTHROPIC = "anthropic"
 
@@ -669,7 +669,7 @@ class ModelConfig(BaseModel):
 # ===========================================================================
 
 
-class ModelRotationScope(StrEnum):
+class ModelRotationScope(str, Enum):
     thread = "thread"
     """
     Default. Fallback/rotation progress within ``AgentManifest.models`` is

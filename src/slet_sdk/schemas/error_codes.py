@@ -1,7 +1,7 @@
-from enum import StrEnum
+from enum import Enum
 
 
-class ErrorCode(StrEnum):
+class ErrorCode(str, Enum):
     """
     Каталог кодов ошибок (не HTTP кодов)
     """
@@ -36,6 +36,9 @@ class ErrorCode(StrEnum):
     ## 409
     CONFLICT = "conflict"  # base
     API_KEY_LIMIT_EXCEEDED = "api_key_limit_exceeded"
+
+    # 413
+    REQUEST_ENTITY_TOO_LARGE = "request_entity_too_large" # base
 
     ## 422
     UNPROCESSABLE_ENTITY = "unprocessable_entity"  # base

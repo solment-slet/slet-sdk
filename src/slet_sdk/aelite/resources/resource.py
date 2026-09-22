@@ -14,6 +14,7 @@ from slet_sdk.aelite.schemas.agents import AgentInfo, AgentInfoWithManifest
 from .agents import AgentsResource
 from .threads import ThreadsResource
 from .tts import TTSResource
+from .ocr import OCRResource
 
 
 class AeliteResource(BaseResource):
@@ -27,6 +28,11 @@ class AeliteResource(BaseResource):
         self.agents = AgentsResource(*args, **kwargs)
         self.threads = ThreadsResource(*args, **kwargs)
         self.tts = TTSResource(*args, **kwargs)
+
+        # OCR-ресурс, владеет собственным сервисом и префиксом.
+        ocr_args = list(args)
+        ocr_args[1] = args[0].api_versions.ocr
+        self.ocr = OCRResource(*ocr_args, **kwargs)
 
     async def connect(
         self,

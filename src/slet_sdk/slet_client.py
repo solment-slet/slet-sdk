@@ -110,7 +110,7 @@ class SletClient:
     ) -> dict | T | None:
         return await self._request_impl(method, url, schema=schema, body=body, **kwargs)
 
-    async def _request_impl(:
+    async def _request_impl(
         self,
         method: str,
         url: str,

@@ -7,6 +7,21 @@ from slet_sdk.schemas.client_base import ErrorResponse
 
 
 # ===========================
+# 400
+# ===========================
+
+
+class BadRequest(ErrorResponse):
+    """
+    Base
+    """
+
+    status: int = 400
+    error: str = ErrorCode.BAD_REQUEST
+    message: str = Field(default="Bad Request")
+
+
+# ===========================
 # 401
 # ===========================
 
@@ -129,6 +144,23 @@ class ApiKeyLimitExceeded(Conflict):
         kwargs.pop("extra", None)
         kwargs["extra"] = ApiKeyLimitExceededExtra(limit=limit, current_count=current_count)
         super().__init__(**kwargs)
+
+
+# ===========================
+# 413
+# ===========================
+
+
+class RequestEntityTooLarge(ErrorResponse):
+    """
+    Base
+    """
+
+    status: int = 413
+    error: str = ErrorCode.REQUEST_ENTITY_TOO_LARGE
+    message: str = Field(
+        default="Request Entity Too Large",
+    )
 
 
 # ===========================

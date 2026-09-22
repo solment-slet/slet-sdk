@@ -262,7 +262,7 @@ class TestMCPResourceMode:
         }
 
     def test_values_are_plain_strings(self):
-        """MCPResourceMode is a StrEnum - values should compare equal to
+        """MCPResourceMode is a Enum - values should compare equal to
         their string form (relevant since resource_mode ends up in
         serialized manifests and placeholder-building logic elsewhere)."""
         assert MCPResourceMode.tool == "tool"
