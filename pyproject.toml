@@ -1,6 +1,6 @@
 [project]
 name = "slet-sdk"
-version = "0.1.1"
+version = "0.2.0"
 authors = [
     { name = "Walter Kerrigan", email = "esolment@gmail.com" },
 ]
@@ -19,7 +19,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-tests = [
+tests = [ # for local reranker server
     "sentence-transformers>=6.0.0",
 ]
 
