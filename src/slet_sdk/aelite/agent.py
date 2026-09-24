@@ -7,6 +7,7 @@ import json
 import mimetypes
 import uuid
 from dataclasses import dataclass, field
+from urllib.parse import urlencode
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -15,14 +16,17 @@ from typing import (
     AsyncIterable,
     Awaitable,
     Callable,
+    TypeVar,
+    overload,
 )
 
 from websockets.exceptions import ConnectionClosed, InvalidStatus
+from pydantic import BaseModel
 
 from slet_sdk.aelite.tools import ToolBelt
 from slet_sdk.exceptions import SletClientError
 from slet_sdk.schemas import ErrorResponse, ErrorCode
-from slet_sdk.schemas.errors import CallbackError, NetworkError
+from slet_sdk.schemas.errors import CallbackError, NetworkError, ProtocolError
 from slet_sdk.aelite.typing import StreamMode
 from slet_sdk.aelite.utils.device_info import get_device_string
 
@@ -38,19 +42,28 @@ if TYPE_CHECKING:
 
 @dataclass
 class TextDelta:
-    """A chunk of the models's regular text response."""
+    """A chunk of the model's regular text response."""
 
     text: str
 
 
 @dataclass
 class ThinkingDelta:
-    """A chunk of the models's thinking/reasoning text."""
+    """A chunk of the model's thinking/reasoning text."""
 
     text: str
 
 
-StreamItem = TextDelta | ThinkingDelta
+@dataclass
+class StructuredResponse:
+    """The final structured response from the agent (complies with the response_schema)."""
+
+    data: dict[str, Any]
+
+
+StreamItem = TextDelta | ThinkingDelta | StructuredResponse
+
+_M = TypeVar("_M", bound=BaseModel)
 
 
 # ---------------------------------------------------------------------------
@@ -118,12 +131,20 @@ class AgentSession:
       its own ``msg`` identifier and is processed independently - you can
       call ``stream()``/``chat()`` concurrently, they don't block each other.
     - The response is split into regular text (``TextDelta``) and the
-      models's thinking (``ThinkingDelta``), if the server/provider provides it.
+      model's thinking (``ThinkingDelta``), if the server/provider provides it.
+      If a ``response_schema`` is passed to ``chat()``/``stream()``/``trigger()``,
+      the agent's final answer is delivered as a single ``StructuredResponse``
+      instead of free text.
     - Agent-initiated messages (broadcasts from triggers, including those
       launched by other devices of the same user) are routed via
-      ``on_message`` (buffered) or ``on_incoming_stream`` (streamed), with
+      ``on_message`` (buffered, ``stream_unsolicited=False``) or
+      ``on_incoming_stream`` (streamed, ``stream_unsolicited=True``), with
       one callback invocation per independent ``msg`` - concurrent
-      unsolicited streams are not mixed with each other.
+      unsolicited streams are not mixed with each other. Only one of these
+      two callbacks is used at a time, depending on ``stream_unsolicited``.
+      A structured response to a trigger is delivered via
+      ``on_structured_response`` when ``stream_unsolicited=False``, and as
+      an item of the ``on_incoming_stream`` generator when it is ``True``.
     - Automatic handling of client tool calls.
     - Automatic reconnect when the connection is dropped.
     """
@@ -153,10 +174,11 @@ class AgentSession:
         self.stream_mode = stream_mode
         self.http_url = base_url
         self.ws_url = ws_base
+        params = {"stream_mode": StreamMode(stream_mode).value}
+        if device:
+            params["device"] = device
         self._ws_connect_url = (
-            f"{self.ws_url}/agents/ws/{self.thread_id}"
-            f"?device={self.device}"
-            f"&stream_mode={self.stream_mode}"
+            f"{self.ws_url}/agents/ws/{self.thread_id}?{urlencode(params)}"
         )
 
         self.headers = headers
@@ -170,9 +192,11 @@ class AgentSession:
         # --- Behavior settings ---
 
         # If True: unsolicited messages are delivered via on_incoming_stream
-        # as an async iterator (chunk by chunk), separately for each msg_id.
-        # If False: text is accumulated in a buffer (also separately per
-        # msg_id) and delivered whole via on_message.
+        # as an async iterator (chunk by chunk, including StructuredResponse),
+        # separately for each msg_id.
+        # If False: text and thinking are accumulated in a buffer (also
+        # separately per msg_id) and delivered whole via on_message; a
+        # StructuredResponse is delivered via on_structured_response.
         self.stream_unsolicited: bool = False
 
         # --- Callbacks ---
@@ -197,7 +221,7 @@ class AgentSession:
         # (created upon receiving the first token for a new msg_id).
         self._unsolicited_streams: dict[str, asyncio.Queue[_QueueItem]] = {}
 
-        # Text buffers for unsolicited messages (stream_unsolicited=False),
+        # Buffers for unsolicited messages (stream_unsolicited=False),
         # one per msg_id.
         self._unsolicited_buffers: dict[str, list[StreamItem]] = {}
 
@@ -261,7 +285,7 @@ class AgentSession:
         self._is_connected = False
 
         await self._cancel_listener()
-        self._cleanup_queues()
+        self._cleanup_queues(NetworkError(message="Disconnected by client."))
 
         for server_id in list(self._mcp_stdio_servers):
             await self.unregister_mcp_server(server_id)
@@ -529,10 +553,11 @@ class AgentSession:
         self,
         message: str,
         files: list[Any] | None = None,
+        response_schema: dict | type[BaseModel] | None = None,
     ) -> AsyncGenerator[StreamItem, None]:
         """
         Sends a message to the agent and returns an async generator of
-        response items (``TextDelta`` / ``ThinkingDelta``).
+        response items (``TextDelta`` / ``ThinkingDelta`` / ``StructuredResponse``).
 
         Each call gets its own ``msg`` and is processed independently of
         other active ``stream()``/``chat()`` calls - they can be called
@@ -545,12 +570,18 @@ class AgentSession:
         files:
             A list of files to attach. Each file can be ``str``,
             ``bytes``, or a file-like object.
+        response_schema:
+            JSON Schema (dict, type='object') or a pydantic class. If specified,
+            the agent completes the response by calling final-tool, and the stream receives
+            one element of ``StructuredResponse`` (free text is not streamed).
 
         Yields
         ------
         StreamItem
             ``TextDelta`` - a chunk of the regular response text.
-            ``ThinkingDelta`` - a chunk of the models's thinking text (if any).
+            ``ThinkingDelta`` - a chunk of the model's thinking text (if any).
+            ``StructuredResponse`` - the complete structured response
+            (arrives once, at the end).
 
         Raises
         ------
@@ -559,6 +590,12 @@ class AgentSession:
             (including a msg conflict - practically impossible with UUID4,
             but would still correctly surface as an exception).
         """
+        schema_dict = (
+            self._normalize_schema(response_schema)
+            if response_schema is not None
+            else None
+        )
+
         attachments: list[dict] = []
         if files:
             for f in files:
@@ -584,12 +621,14 @@ class AgentSession:
             }
             if attachments:
                 payload["attachments"] = attachments
+            if schema_dict is not None:
+                payload["response_schema"] = schema_dict
             await self.send(json.dumps(payload))
 
             while True:
                 item = await queue.get()
                 match item:
-                    case TextDelta() | ThinkingDelta():
+                    case TextDelta() | ThinkingDelta() | StructuredResponse():
                         yield item
                     case _End():
                         break
@@ -598,18 +637,42 @@ class AgentSession:
         finally:
             self._response_queues.pop(msg_id, None)
 
+    @overload
+    async def chat(
+        self, message: str, files: list[Any] | None = None, *,
+        response_schema: None = None,
+    ) -> str: ...
+
+    @overload
+    async def chat(
+        self, message: str, files: list[Any] | None = None, *,
+        response_schema: type[_M],
+    ) -> _M: ...
+
+    @overload
+    async def chat(
+        self, message: str, files: list[Any] | None = None, *,
+        response_schema: dict,
+    ) -> dict: ...
+
+    @overload
+    async def chat(
+        self, message: str, files: list[Any] | None = None, *,
+        response_schema: dict | type[BaseModel],
+    ) -> dict | BaseModel: ...
+
     async def chat(
         self,
         message: str,
         files: list[Any] | None = None,
-    ) -> str:
+        response_schema: dict | type[BaseModel] | None = None,
+    ) -> str | dict | BaseModel:
         """
-        Sends a message and returns the agent's full text response
-        (no thinking - only ``TextDelta``).
+        Sends a message and returns the agent's full response.
 
-        A convenience wrapper over ``stream()`` that collects text chunks
-        into a single string. Use ``chat_with_thinking()`` if you also
-        need the models's thinking text.
+        Without ``response_schema`` returns the accumulated text (no thinking).
+        With ``response_schema`` returns the structured result: a ``dict``, or
+        a model instance if a pydantic class was passed.
 
         Parameters
         ----------
@@ -617,41 +680,97 @@ class AgentSession:
             The user's message text.
         files:
             A list of files to attach.
+        response_schema:
+            JSON Schema (dict, type='object') or a pydantic class.
 
         Returns
         -------
-        str
-            The agent's full text response.
+        str | dict | BaseModel
+            The agent's full response.
         """
         chunks: list[str] = []
-        async for item in self.stream(message=message, files=files):
+        structured: dict | None = None
+        async for item in self.stream(
+            message=message, files=files, response_schema=response_schema
+        ):
             if isinstance(item, TextDelta):
                 chunks.append(item.text)
-        return "".join(chunks)
+            elif isinstance(item, StructuredResponse):
+                structured = item.data
+
+        return self._finalize_structured(structured, response_schema)
+
+    @overload
+    async def chat_with_thinking(
+        self, message: str, files: list[Any] | None = None, *,
+        response_schema: None = None,
+    ) -> tuple[str, str]: ...
+
+    @overload
+    async def chat_with_thinking(
+        self, message: str, files: list[Any] | None = None, *,
+        response_schema: type[_M],
+    ) -> tuple[_M, str]: ...
+
+    @overload
+    async def chat_with_thinking(
+        self, message: str, files: list[Any] | None = None, *,
+        response_schema: dict,
+    ) -> tuple[dict, str]: ...
+
+    @overload
+    async def chat_with_thinking(
+        self, message: str, files: list[Any] | None = None, *,
+        response_schema: dict | type[BaseModel],
+    ) -> tuple[dict | BaseModel, str]: ...
 
     async def chat_with_thinking(
         self,
         message: str,
         files: list[Any] | None = None,
-    ) -> tuple[str, str]:
+        response_schema: dict | type[BaseModel] | None = None,
+    ) -> tuple[str | dict | BaseModel, str]:
         """
         Like ``chat()``, but additionally returns the accumulated
-        models thinking text.
+        model thinking text.
+
+        Parameters
+        ----------
+        message:
+            The user's message text.
+        files:
+            A list of files to attach.
+        response_schema:
+            JSON Schema (dict, type='object') or a pydantic class. If given,
+            the first element of the result is the structured response
+            (a ``dict``, or a model instance if a pydantic class was passed)
+            instead of the accumulated text.
 
         Returns
         -------
-        tuple[str, str]
-            (response text, thinking text). The second element is an
-            empty string if the provider/agent did not supply thinking.
+        tuple[str | dict | BaseModel, str]
+            (response, thinking text). The second element is an empty string
+            if the provider/agent did not supply thinking.
         """
         text_chunks: list[str] = []
         thinking_chunks: list[str] = []
-        async for item in self.stream(message=message, files=files):
+        structured: dict | None = None
+        async for item in self.stream(
+            message=message, files=files, response_schema=response_schema
+        ):
             if isinstance(item, TextDelta):
                 text_chunks.append(item.text)
-            else:
+            elif isinstance(item, ThinkingDelta):
                 thinking_chunks.append(item.text)
-        return "".join(text_chunks), "".join(thinking_chunks)
+            elif isinstance(item, StructuredResponse):
+                structured = item.data
+
+        thinking = "".join(thinking_chunks)
+
+        if response_schema is None:
+            return "".join(text_chunks), thinking
+
+        return self._finalize_structured(structured, response_schema), thinking
 
     async def upload_file(self, file: Any) -> dict:
         """
@@ -713,16 +832,17 @@ class AgentSession:
         self,
         name: str,
         payload: dict[str, Any] | None = None,
+        response_schema: dict | type[BaseModel] | None = None,
     ) -> str:
         """
         Sends a trigger (event) to the agent without waiting for a response.
 
         The response to the trigger (and its errors) is broadcast to all
         devices of the session, including the initiator - use the
-        ``on_message`` / ``on_incoming_stream`` / ``on_server_error``
+        ``on_message`` / ``on_structured_response`` (buffered mode) or
+        ``on_incoming_stream`` (streamed mode), and ``on_server_error``
         callbacks to receive it. The returned ``msg_id`` can be used to
-        match it with these callbacks (they receive ``msg_id`` as the
-        first argument).
+        match it with these callbacks.
 
         Parameters
         ----------
@@ -730,6 +850,8 @@ class AgentSession:
             The trigger name.
         payload:
             Arbitrary event data.
+        response_schema:
+            JSON Schema (dict, type='object') or a pydantic class.
 
         Returns
         -------
@@ -746,7 +868,14 @@ class AgentSession:
             raise ConnectionError("Not connected.")
 
         msg_id = str(uuid.uuid4())
-        event = {"type": "trigger", "msg": msg_id, "name": name, "payload": payload or {}}
+        event: dict[str, Any] = {
+            "type": "trigger",
+            "msg": msg_id,
+            "name": name,
+            "payload": payload or {},
+        }
+        if response_schema is not None:
+            event["response_schema"] = self._normalize_schema(response_schema)
         await self.send(json.dumps(event))
         return msg_id
 
@@ -813,6 +942,43 @@ class AgentSession:
     # Helper private methods
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _normalize_schema(schema: dict | type[BaseModel]) -> dict:
+        if isinstance(schema, type) and issubclass(schema, BaseModel):
+            return schema.model_json_schema()
+        if isinstance(schema, dict):
+            return schema
+        raise TypeError(
+            f"response_schema must be a JSON Schema dict or a pydantic model class, "
+            f"got {type(schema).__name__}."
+        )
+
+    @staticmethod
+    def _finalize_structured(
+        structured: dict | None,
+        response_schema: dict | type[BaseModel],
+    ) -> dict | BaseModel:
+        if structured is None:
+            raise SletClientError(
+                ProtocolError(
+                    message=(
+                        "Agent finished without a structured response. "
+                        "The server may not support response_schema."
+                    )
+                )
+            )
+        if isinstance(response_schema, type) and issubclass(response_schema, BaseModel):
+            return response_schema.model_validate(structured)
+        return structured
+
+    def _report_protocol_error(self, message: str) -> None:
+        """
+        Reports a protocol violation (malformed data from the server) via
+        ``on_error`` without interrupting the read loop.
+        """
+        self.logger.warning(message)
+        self._invoke_callback(self.on_error, SletClientError(ProtocolError(message=message)))
+
     async def _connect_websocket(self) -> None:
         self.websocket = await self._resource.websockets.connect(
             self._ws_connect_url,
@@ -828,15 +994,31 @@ class AgentSession:
         Callbacks support both async and sync functions.
         """
 
-        # Called when a full unsolicited message is received.
-        # (stream_unsolicited=False). Signature: (text, thinking, msg_id).
+        # Called when a full unsolicited message is received
+        # (stream_unsolicited=False only). Signature: (text, thinking, msg_id).
         # thinking - an empty string if there was no thinking.
+        # Not invoked when stream_unsolicited=True (use on_incoming_stream
+        # instead). Also not invoked if the response contained neither text
+        # nor thinking (e.g. only a StructuredResponse; see
+        # on_structured_response).
         self.on_message: (
             Callable[[str, str, str], None | Awaitable[None]]
         ) | None = None
 
-        # Called when a new unsolicited stream starts.
-        # (stream_unsolicited=True). Signature: (msg_id, generator).
+        # Called when a structured response to an unsolicited request (trigger)
+        # is received (stream_unsolicited=False only). Signature: (data, msg_id).
+        # Invoked at the end of the answer, after on_message (if any).
+        # Not invoked when stream_unsolicited=True: StructuredResponse is then
+        # delivered as an item of the on_incoming_stream generator.
+        self.on_structured_response: (
+            Callable[[dict, str | None], None | Awaitable[None]]
+        ) | None = None
+
+        # Called when a new unsolicited stream starts
+        # (stream_unsolicited=True only). Signature: (msg_id, generator).
+        # The generator yields every StreamItem (TextDelta, ThinkingDelta,
+        # StructuredResponse). Not invoked when stream_unsolicited=False
+        # (use on_message instead).
         self.on_incoming_stream: (
             Callable[[str, AsyncIterable[StreamItem]], None | Awaitable[None]]
         ) | None = None
@@ -886,20 +1068,23 @@ class AgentSession:
         await self._cancel_listener()
         self._listener_task = asyncio.create_task(self._listen_loop())
 
-    def _cleanup_queues(self) -> None:
+    def _cleanup_queues(self, error: NetworkError | None = None) -> None:
         """
         Unblocks everyone waiting on connection loss and clears the buffers.
 
-        Should be called from ``_listen_loop`` before attempting a reconnect.
-        Each active ``stream()``/``chat()`` receives an ``_End`` in its own
-        queue (it removes its own entry in ``finally``); all active
-        unsolicited streams are also terminated.
+        If ``error`` is given, active ``stream()``/``chat()`` calls (and
+        unsolicited streams) are terminated with that error instead of a
+        normal end-of-stream, so a dropped connection is never mistaken for
+        a complete (or truncated but "successful") response.
         """
+        def marker() -> _QueueItem:
+            return _Error(error) if error is not None else _End()
+
         for queue in self._response_queues.values():
-            queue.put_nowait(_End())
+            queue.put_nowait(marker())
 
         for queue in self._unsolicited_streams.values():
-            queue.put_nowait(_End())
+            queue.put_nowait(marker())
         self._unsolicited_streams.clear()
         self._unsolicited_buffers.clear()
 
@@ -925,17 +1110,30 @@ class AgentSession:
             async for raw_msg in self.websocket:
                 try:
                     data = json.loads(raw_msg)
-                except json.JSONDecodeError:
-                    self.logger.warning(
-                        f"Received a message that is not valid JSON: {raw_msg!r}"
+                except json.JSONDecodeError as e:
+                    self._report_protocol_error(
+                        f"Received a message that is not valid JSON: {e}. "
+                        f"Raw (truncated): {raw_msg[:200]!r}"
                     )
                     continue
 
                 if not isinstance(data, dict) or "type" not in data:
-                    self.logger.warning(f"Received a message of unknown format: {data!r}")
+                    self._report_protocol_error(
+                        f"Received a message of unknown format: {str(data)[:200]!r}"
+                    )
                     continue
 
-                await self._dispatch_event(data)
+                try:
+                    await self._dispatch_event(data)
+                except Exception as e:
+                    err = ProtocolError(
+                        message=f"Failed to process event {data.get('type')!r}: {e}"
+                    )
+                    self.logger.warning(err.message)
+                    self._invoke_callback(self.on_error, SletClientError(err))
+                    queue = self._response_queues.get(data.get("msg"))
+                    if queue is not None:
+                        queue.put_nowait(_Error(err))
 
         except ConnectionClosed as e:
             self.logger.warning(f"WebSocket closed: {e}")
@@ -973,11 +1171,17 @@ class AgentSession:
         elif event_type == "thinking_response":
             await self._route_item(msg_id, ThinkingDelta(data.get("payload", "")))
 
+        elif event_type == "structured_response":
+            await self._route_item(msg_id, StructuredResponse(data=data.get("payload", {})))
+
         elif event_type == "end_of_answer":
             await self._route_end(msg_id)
 
         elif event_type == "error":
-            err = ErrorResponse(**data.get("payload", {}))
+            try:
+                err = ErrorResponse(**data.get("payload", {}))
+            except Exception as e:
+                err = ProtocolError(message=f"Malformed error payload from server: {e}")
             await self._route_error(msg_id, err)
 
         elif event_type == "client_tool_call":
@@ -1007,7 +1211,8 @@ class AgentSession:
 
     async def _route_item(self, msg_id: str | None, item: StreamItem) -> None:
         """
-        Routes a response chunk (text/thinking) either to the queue of an
+        Routes a response chunk
+        (text/thinking/structured response) either to the queue of an
         active stream()/chat(), or to unsolicited handling, depending on
         whether this ``msg_id`` is registered locally.
         """
@@ -1037,7 +1242,11 @@ class AgentSession:
             if items:
                 text = "".join(i.text for i in items if isinstance(i, TextDelta))
                 thinking = "".join(i.text for i in items if isinstance(i, ThinkingDelta))
-                self._invoke_callback(self.on_message, text, thinking, msg_id)
+                if text or thinking:
+                    self._invoke_callback(self.on_message, text, thinking, msg_id)
+                for i in items:
+                    if isinstance(i, StructuredResponse):
+                        self._invoke_callback(self.on_structured_response, i.data, msg_id)
 
     async def _route_error(self, msg_id: str | None, error: ErrorResponse) -> None:
         """
@@ -1067,10 +1276,10 @@ class AgentSession:
             reason did not send a ``msg`` - the event is logged and
             dropped, since it cannot be correctly grouped with the rest.
         item:
-            A chunk of text/thinking from the agent.
+            A chunk of text/thinking or the structured response from the agent.
         """
         if msg_id is None:
-            self.logger.warning("Unsolicited event without msg - dropped.")
+            self._report_protocol_error("Unsolicited event without msg - dropped.")
             return
 
         if self.stream_unsolicited:
@@ -1098,7 +1307,7 @@ class AgentSession:
             Description of the failure cause.
         """
         self._is_connected = False
-        self._cleanup_queues()
+        self._cleanup_queues(error)
 
         if not self._manual_disconnect:
             if self.on_error:
@@ -1204,12 +1413,12 @@ class AgentSession:
         Yields
         ------
         StreamItem
-            ``TextDelta`` / ``ThinkingDelta``.
+            ``TextDelta`` / ``ThinkingDelta`` / ``StructuredResponse``.
         """
         while True:
             item = await queue.get()
             match item:
-                case TextDelta() | ThinkingDelta():
+                case TextDelta() | ThinkingDelta() | StructuredResponse():
                     yield item
                 case _End():
                     break

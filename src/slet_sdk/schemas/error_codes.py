@@ -67,6 +67,7 @@ class ErrorCode(str, Enum):
     ## >599 (Custom Errors)
     NETWORK_ERROR = "network_error"
     CALLBACK_ERROR = "callback_error"
+    PROTOCOL_ERROR = "protocol_error"
     BACKGROUND_LISTENER_ERROR = "background_listener_error"
 
     ## Anything (Without the desired HTTP code)

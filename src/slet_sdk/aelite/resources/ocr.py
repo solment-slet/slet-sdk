@@ -3,7 +3,7 @@ from io import BytesIO
 from typing import Union
 
 from slet_sdk.core.mixins import BaseResource
-from slet_sdk.aelite.schemas.ocr import OCRResponse
+from slet_sdk.aelite.schemas.ocr import OCRResponse, VLOCRResponse
 
 ImageSource = Union[bytes, bytearray, pathlib.Path]
 
@@ -14,9 +14,53 @@ class OCRResource(BaseResource):
         image: ImageSource,
         *,
         combine_line_breaks: bool = False,
+    ) -> VLOCRResponse:
+        """
+        Extract text from an image via VL OCR pipeline.
+
+        Parameters
+        ----------
+        image : bytes, bytearray, or pathlib.Path
+            Raw image bytes or a path to an image file.
+            Supported formats: PNG, JPEG, TIFF, BMP, WEBP.
+        combine_line_breaks : bool
+            Whether to merge consecutive line breaks in the output.
+
+        Returns
+        -------
+        VLOCRResponse
+            OCR result from the API.
+
+        Raises
+        ------
+        ValueError
+            If the image format is unrecognized or unsupported.
+        TypeError
+            If ``image`` is not bytes, bytearray, or pathlib.Path.
+        """
+        files_payload = OCRResource._normalize_image(image)
+
+        return await self._request(
+            "POST",
+            "/image",
+            schema=VLOCRResponse,
+            data={
+                "pipeline": "vl",
+                "combine_line_breaks": "true" if combine_line_breaks else "false",
+            },
+            files=files_payload,
+        )
+
+    async def extract_blocks( # DEPRECATED! The recognition quality is too low! Use `extract_text` instead.
+        self,
+        image: ImageSource,
+        *,
+        combine_line_breaks: bool = False,
     ) -> OCRResponse:
         """
-        Extract text from an image via OCR.
+        DEPRECATED! The recognition quality is too low! Use `extract_text` instead.
+
+        Extract text blocks from an image via classic OCR pipeline.
 
         Parameters
         ----------
@@ -38,19 +82,7 @@ class OCRResource(BaseResource):
         TypeError
             If ``image`` is not bytes, bytearray, or pathlib.Path.
         """
-        files_payload: dict = {}
-
-        if isinstance(image, (bytes, bytearray)):
-            data = bytes(image)
-            ext, mime = self._detect_format(data)
-            files_payload["file"] = (f"image.{ext}", BytesIO(data), mime)
-        elif isinstance(image, pathlib.Path):
-            files_payload["file"] = (image.name, image.open("rb"))
-        else:
-            raise TypeError(
-                f"Unsupported image source type: {type(image).__name__}. "
-                "Expected bytes, bytearray, or pathlib.Path."
-            )
+        files_payload = OCRResource._normalize_image(image)
 
         return await self._request(
             "POST",
@@ -62,6 +94,24 @@ class OCRResource(BaseResource):
             },
             files=files_payload,
         )
+
+    @staticmethod
+    def _normalize_image(image: ImageSource) -> dict[str, tuple]:
+        files_payload: dict = {}
+
+        if isinstance(image, (bytes, bytearray)):
+            data = bytes(image)
+            ext, mime = OCRResource._detect_format(data)
+            files_payload["file"] = (f"image.{ext}", BytesIO(data), mime)
+        elif isinstance(image, pathlib.Path):
+            files_payload["file"] = (image.name, image.open("rb"))
+        else:
+            raise TypeError(
+                f"Unsupported image source type: {type(image).__name__}. "
+                "Expected bytes, bytearray, or pathlib.Path."
+            )
+
+        return files_payload
 
     @staticmethod
     def _detect_format(data: bytes) -> tuple[str, str]:

@@ -348,3 +348,12 @@ class CallbackError(CustomError):
 
     status: int = 600
     error: str = ErrorCode.CALLBACK_ERROR
+
+
+class ProtocolError(CustomError):
+    """
+    Protocol error
+    """
+
+    status: int = 600
+    error: str = ErrorCode.PROTOCOL_ERROR

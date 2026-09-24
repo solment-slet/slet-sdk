@@ -555,6 +555,14 @@ class ModelConfig(BaseModel):
             "these models reject them."
         ),
     )
+    reasoning_format: str | None = Field(
+        default=None,
+        description=(
+            "Value for the provider-specific `reasoning_format` request field. "
+            "E.g. 'parsed' for Groq, 'deepseek' or 'auto' for llama.cpp. "
+            "If None, the field is not sent."
+        ),
+    )
     reasoning_effort: Literal["low", "medium", "high"] | None = Field(
         default=None,
         description=(
@@ -573,8 +581,9 @@ class ModelConfig(BaseModel):
             "emits intermediate reasoning steps before its final answer. "
             "Note: for Anthropic models this forces temperature=1 and "
             "disables top_p, per the provider's API constraints. For "
-            "OPENAI_COMPATIBLE providers, this requires is_reasoning_model=True "
-            "or reasoning_effort to be set, otherwise it has no effect."
+            "OPENAI_COMPATIBLE providers, this requires is_reasoning_model=True, "
+            "reasoning_effort or reasoning_format to be set, otherwise it has "
+            "no effect."
         ),
     )
     thinking_budget_tokens: int | None = Field(
@@ -585,6 +594,14 @@ class ModelConfig(BaseModel):
             "Only applies when thinking_enabled=True. Primarily relevant to "
             "Anthropic extended thinking; ignored by providers that don't "
             "support a configurable reasoning budget."
+        ),
+    )
+    native_structured_output: bool = Field(
+        default=False,
+        description=(
+            "Use the provider's native structured output (response_format=json_schema) "
+            "when the client requests a response_schema. If False, or if the provider has "
+            "no native support (Anthropic), an internal `submit_final_response` tool is used instead."
         ),
     )
     use_for_amem: bool = Field(
@@ -617,14 +634,12 @@ class ModelConfig(BaseModel):
     @model_validator(mode="after")
     def _validate_thinking_requires_reasoning_mode(self):
         """
-        For ProviderKind.OPENAI_COMPATIBLE, thinking_enabled only has an
-        effect inside the `if is_reasoning_model:` branch in _build_llm
-        (app/services/model_manager.py) - that's where extra_body with
-        reasoning_format is attached. If is_reasoning_model=False and
-        reasoning_effort is unset, that whole branch is skipped and
-        thinking_enabled is silently a no-op: the request never asks the
-        provider for reasoning content, and no thinking is ever returned,
-        with no error surfaced anywhere.
+        For ProviderKind.OPENAI_COMPATIBLE, thinking_enabled selects the client
+        that extracts reasoning fields from responses, but the provider only
+        returns them if it was asked to: via reasoning_effort, via the
+        provider-specific reasoning_format, or if the model is a known
+        reasoning model (is_reasoning_model). Without any of these,
+        thinking_enabled is silently a no-op.
 
         Does not apply to ProviderKind.ANTHROPIC, where thinking_enabled
         drives its own independent `thinking` API parameter.
@@ -632,16 +647,28 @@ class ModelConfig(BaseModel):
         if (
             self.kind == ProviderKind.OPENAI_COMPATIBLE
             and self.thinking_enabled
-            and not self.is_reasoning_model
-            and not self.reasoning_effort
+            and not (self.is_reasoning_model or self.reasoning_effort or self.reasoning_format)
         ):
             raise ValueError(
                 "thinking_enabled=True has no effect for an OPENAI_COMPATIBLE "
-                "provider unless is_reasoning_model=True or reasoning_effort "
-                "is set - otherwise the reasoning_format request parameter is "
-                "never sent and no reasoning/thinking content will be "
-                "returned. Set is_reasoning_model=True (and/or reasoning_effort) "
-                "if this models is a reasoning models, or set thinking_enabled=False."
+                "provider unless is_reasoning_model=True, reasoning_effort or "
+                "reasoning_format is set - otherwise no reasoning/thinking "
+                "content will be requested from the provider. Set one of them "
+                "if this model is a reasoning model, or set thinking_enabled=False."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_reasoning_format_provider(self):
+        """
+        reasoning_format is an OpenAI-compatible request field (Groq,
+        llama.cpp, ...). _build_llm never reads it for ProviderKind.ANTHROPIC.
+        """
+        if self.kind == ProviderKind.ANTHROPIC and self.reasoning_format:
+            raise ValueError(
+                "reasoning_format has no effect for kind=ANTHROPIC - Anthropic "
+                "extended thinking is controlled via thinking_enabled and "
+                "thinking_budget_tokens instead. Remove reasoning_format."
             )
         return self
 

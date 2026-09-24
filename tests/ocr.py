@@ -140,7 +140,7 @@ def preprocess_universal(img, output_path="prepared.png"):
     return output_path
 
 
-path = pathlib.Path("/home/esolment/Изображения/14G.jpg")
+path = pathlib.Path("/home/esolment/Изображения/Yakob.webp")
 
 from prepare_book import prepare_book_scan
 
@@ -154,16 +154,10 @@ async def main():
     async with SletClient(base_url="http://localhost:8080", ssl_verify=False) as c:
         await c.signin("testesolment@gmail.com", "20132061netT%")
 
-        print(c.access_token)
-        return
-
-        ocr = await c.aelite.ocr.extract_text(
-            path,
-            combine_line_breaks=True,
-        )
+        ocr = await c.aelite.ocr.extract_text(pathlib.Path("prepared.png"), combine_line_breaks=True)
         print(ocr.plain_text)
         print()
-        print(ocr)
+        print(ocr.combined_text)
         print()
 
 
