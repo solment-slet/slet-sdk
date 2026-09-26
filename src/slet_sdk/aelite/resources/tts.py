@@ -9,7 +9,7 @@ from websockets.exceptions import ConnectionClosed
 from websockets.asyncio.connection import Connection
 
 from slet_sdk.aelite.manifest import TTSConfig
-from slet_sdk.aelite.types import TTSStreamItem
+from slet_sdk.aelite.types import TTSStreamItem, TTSStreamConfig
 
 
 class TTSResource(BaseResource):
@@ -54,13 +54,14 @@ class TTSResource(BaseResource):
             Exception: On other internal WebSocket errors.
         """
         url = f"{self.base_ws_url}/tts/ws"
+        headers = {"Authorization": f"Bearer {self._access_token}"}
 
         # Session configuration.
         session_config = tts_config.model_dump()
         # Drop None values so we don't send garbage to the server.
         session_config = {k: v for k, v in session_config.items() if v is not None}
 
-        async with websockets.connect(url) as ws:
+        async with websockets.connect(url, additional_headers=headers) as ws:
             # 1. Send the initial config (optional if defaults are fine, but
             # it's better to set the voice explicitly).
             await ws.send(json.dumps(session_config))
