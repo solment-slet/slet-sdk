@@ -1,5 +1,5 @@
 from pydantic import BaseModel, EmailStr, IPvAnyAddress
-from slet_sdk.typing import UserPrivilege
+from slet_sdk.types import UserPrivilege
 
 
 class UserContext(BaseModel):

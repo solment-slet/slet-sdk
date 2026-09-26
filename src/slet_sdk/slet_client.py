@@ -21,7 +21,7 @@ from slet_sdk.schemas.auth import (
     UserRefreshResponse,
 )
 from slet_sdk.aelite.resources.resource import AeliteResource
-from slet_sdk.typing import LoggerLike, WebsocketsModule
+from slet_sdk.types import LoggerLike, WebsocketsModule
 from slet_sdk.config import ApiPrefixes
 
 

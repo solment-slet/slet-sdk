@@ -5,7 +5,7 @@ from pydantic import BaseModel
 
 if TYPE_CHECKING:
     from slet_sdk.slet_client import SletClient
-    from slet_sdk.typing import LoggerLike, WebsocketsModule
+    from slet_sdk.types import LoggerLike, WebsocketsModule
 
 T = TypeVar("T", bound=BaseModel)
 

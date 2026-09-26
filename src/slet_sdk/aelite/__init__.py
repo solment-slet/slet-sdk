@@ -1,7 +1,8 @@
 from slet_sdk.aelite.agent import AgentSession
-from .typing import StreamMode
+from .types import StreamMode, TTSStreamConfig
 
 __all__ = [
     "AgentSession",
     "StreamMode",
+    "TTSStreamConfig",
 ]

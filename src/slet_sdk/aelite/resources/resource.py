@@ -5,7 +5,7 @@ from uuid import UUID
 from slet_sdk.core.mixins import BaseResource
 from slet_sdk.aelite.agent import AgentSession
 from slet_sdk.aelite.manifest import AgentManifest
-from slet_sdk.aelite.typing import StreamMode
+from slet_sdk.aelite.types import StreamMode
 from slet_sdk.aelite.schemas.threads import ThreadInfo, ThreadPermissions, ThreadCreateResponse
 from slet_sdk.aelite.schemas.agents import AgentInfo, AgentInfoWithManifest
 

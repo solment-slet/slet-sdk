@@ -27,7 +27,7 @@ from slet_sdk.aelite.tools import ToolBelt
 from slet_sdk.exceptions import SletClientError
 from slet_sdk.schemas import ErrorResponse, ErrorCode
 from slet_sdk.schemas.errors import CallbackError, NetworkError, ProtocolError
-from slet_sdk.aelite.typing import StreamMode
+from slet_sdk.aelite.types import StreamMode
 from slet_sdk.aelite.utils.device_info import get_device_string
 
 if TYPE_CHECKING:

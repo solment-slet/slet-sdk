@@ -9,6 +9,7 @@ from websockets.exceptions import ConnectionClosed
 from websockets.asyncio.connection import Connection
 
 from slet_sdk.aelite.manifest import TTSConfig
+from slet_sdk.aelite.types import TTSStreamItem
 
 
 class TTSResource(BaseResource):
@@ -18,42 +19,62 @@ class TTSResource(BaseResource):
         tts_config: TTSConfig = TTSConfig(),
         smart_buffering: bool = True,
         smart_buffer_max_chunk_size: int = 200,
-    ) -> AsyncGenerator[bytes, None]:
+    ) -> AsyncGenerator[TTSStreamItem, None]:
         """
-        Потоковый клиент для Piper TTS. Принимает поток текста (например, от LLM),
-        автоматически буферизует его по предложениям и возвращает поток аудио-байтов.
+        Streaming client for Piper TTS. Consumes a stream of text (e.g. LLM
+        tokens), buffers it into sentences automatically, and yields the
+        resulting audio stream.
+
+        The first item yielded is always a `TTSStreamConfig` describing the
+        audio format (sample_rate/sample_width/channels), sent by the server
+        in its "config" event. Every item after that is a `bytes` chunk of
+        raw PCM int16 audio. Callers MUST check the type of each yielded
+        item (e.g. `isinstance(item, TTSStreamConfig)`) before treating it
+        as audio.
 
         Args:
-            text_iterator (AsyncIterator[str]): Асинхронный генератор, выдающий куски текста (токены).
-            tts_config (TTSConfig): Настройки TTS.
-            smart_buffering (bool): Если True, собирает токены в предложения перед отправкой.
-            smart_buffer_max_chunk_size (int): Лимит буфера (символов), чтобы не копить бесконечно, если нет точек.
+            text_iterator (AsyncIterator[str]): Async generator producing
+                chunks of text (tokens).
+            tts_config (TTSConfig): TTS settings (voice, speaker_id, etc).
+            smart_buffering (bool): If True, accumulate tokens into full
+                sentences before sending them to the server.
+            smart_buffer_max_chunk_size (int): Buffer length limit (chars)
+                so we don't accumulate forever when there's no punctuation.
 
         Yields:
-            bytes: Чанки аудио (Raw PCM int16).
+            TTSStreamConfig: Exactly once, before any audio, describing the
+                audio format.
+            bytes: Raw PCM int16 audio chunks.
 
         Raises:
-            ConnectionClosed: Если сервер разорвал соединение.
-            Exception: При ошибках внутри WebSocket.
+            ConnectionClosed: If the server closes the connection
+                unexpectedly.
+            RuntimeError: If the server reports an "error" event, or if the
+                connection closes before a "config" event was ever received.
+            Exception: On other internal WebSocket errors.
         """
         url = f"{self.base_ws_url}/tts/ws"
 
-        # Конфигурация сессии
+        # Session configuration.
         session_config = tts_config.model_dump()
-        # Очищаем None значения, чтобы не слать мусор
+        # Drop None values so we don't send garbage to the server.
         session_config = {k: v for k, v in session_config.items() if v is not None}
 
         async with websockets.connect(url) as ws:
-            # 1. Отправляем стартовый конфиг (можно и не отправлять, если устраивает дефолт,
-            # но лучше задать голос явно)
+            # 1. Send the initial config (optional if defaults are fine, but
+            # it's better to set the voice explicitly).
             await ws.send(json.dumps(session_config))
 
-            # Очередь для сигнализации об окончании отправки текста.
-            # Используем Event, чтобы главный цикл знал, когда мы закончили слать текст
+            # Event used to signal that we're done sending text.
             sender_task_done = asyncio.Event()
 
+            # Whether we've already yielded the TTSStreamConfig to the
+            # caller. The server sends "config" once per connection, but we
+            # guard against sending it twice just in case.
+            config_sent = False
+
             # ------------------------------------------------------------------
-            # Внутренняя задача: Чтение из итератора -> Буферизация -> Отправка
+            # Internal task: read from the iterator -> buffer -> send
             # ------------------------------------------------------------------
             async def _sender_loop():
                 try:
@@ -64,54 +85,87 @@ class TTSResource(BaseResource):
                     else:
                         await self._passthrough_sender(text_iterator, ws)
                 except Exception as e:
-                    self.logger.error(f"Ошибка в sender_loop: {e}")
+                    self.logger.error(f"Error in sender_loop: {e}")
                 finally:
                     sender_task_done.set()
 
-            # Запускаем отправку в фоне, чтобы не блокировать получение аудио
+            # Run the sender in the background so it doesn't block receiving
+            # audio.
             sender_task = asyncio.create_task(_sender_loop())
 
             # ------------------------------------------------------------------
-            # Главный цикл: Получение аудио и событий от сервера
+            # Main loop: receive audio and events from the server
             # ------------------------------------------------------------------
             try:
                 while True:
                     try:
-                        # Ждем сообщения от сервера.
-                        # Если sender закончил работу, мы все равно продолжаем читать,
-                        # пока сервер не пришлет {"event": "done"}
+                        # Wait for a message from the server. Even if the
+                        # sender has finished, we keep reading until the
+                        # server sends {"event": "done"}.
                         msg = await ws.recv()
 
                         if isinstance(msg, bytes):
-                            # Это аудио-чанк
+                            # This is an audio chunk.
+                            if not config_sent:
+                                # Defensive: the server should always send
+                                # "config" before any audio, but if it
+                                # didn't, we can't tell the caller the
+                                # audio format. Fail loudly instead of
+                                # silently yielding un-describable bytes.
+                                raise RuntimeError(
+                                    "Received audio bytes before a 'config' "
+                                    "event; cannot determine audio format."
+                                )
                             yield msg
                         else:
-                            # Это JSON событие
+                            # This is a JSON event.
                             event = json.loads(msg)
+                            event_type = event.get("event")
 
-                            if event.get("event") == "done":
-                                # Сервер подтвердил, что синтез полностью, завершен
-                                break
-
-                            if event.get("event") == "error":
-                                self.logger.error(
-                                    f"TTS Server Error: {event.get('message')}"
+                            if event_type == "config":
+                                # First message: audio format descriptor.
+                                stream_config = TTSStreamConfig(
+                                    sample_rate=event["sample_rate"],
+                                    sample_width=event["sample_width"],
+                                    channels=event["channels"],
                                 )
-                                # Можно рейзить ошибку или просто прерывать
+                                config_sent = True
+                                yield stream_config
+
+                            elif event_type == "done":
+                                # Server confirmed synthesis is fully done.
                                 break
+
+                            elif event_type == "error":
+                                message = event.get("message")
+                                self.logger.error(f"TTS Server Error: {message}")
+                                raise RuntimeError(f"TTS Server Error: {message}")
+
+                            elif event_type in ("synthesis_start", "synthesis_end"):
+                                # Informational per-chunk markers; nothing
+                                # for the caller to do with these right now.
+                                self.logger.debug(
+                                    f"TTS event: {event_type} "
+                                    f"(index={event.get('index')})"
+                                )
+
+                            else:
+                                self.logger.debug(
+                                    f"Unhandled TTS event: {event_type}"
+                                )
 
                     except ConnectionClosed:
-                        self.logger.warning("Соединение с TTS закрыто сервером.")
+                        self.logger.warning("TTS connection closed by server.")
                         break
 
             finally:
-                # Убедимся, что задача отправки тоже завершена (или отменяем её)
+                # Make sure the sender task is also finished (or cancel it).
                 if not sender_task.done():
                     sender_task.cancel()
                 await sender_task
 
     # --------------------------------------------------------------------------
-    # Логика буферизации
+    # Buffering logic
     # --------------------------------------------------------------------------
 
     async def _smart_buffer_sender(
@@ -121,50 +175,53 @@ class TTSResource(BaseResource):
         max_buffer_size: int,
     ):
         """
-        Накапливает текст до знаков препинания (. ? ! \n) или до лимита длины,
-        чтобы отправлять в TTS осмысленные фразы.
+        Accumulates text up to sentence-ending punctuation (. ? ! \\n) or up
+        to a length limit, so we send meaningful phrases to the TTS server.
         """
         buffer = ""
-        # Регулярка для поиска конца предложения: точка, вопрос, восклицание или перевод строки,
-        # за которыми следует пробел или конец строки.
-        # Группируем разделитель, чтобы оставить его в отправляемом куске.
+        # Regex to find the end of a sentence: period, question mark,
+        # exclamation mark, or newline, followed by whitespace or end of
+        # string. The separator is captured so it stays in the sent chunk.
         split_pattern = re.compile(r"([.?!]+(?:\s|$)|[\n]+)")
 
         async for chunk in text_iter:
             buffer += chunk
 
             while True:
-                # Пытаемся найти разделитель предложения
+                # Try to find a sentence boundary.
                 match = split_pattern.search(buffer)
 
                 if match:
-                    # Нашли конец предложения
+                    # Found the end of a sentence.
                     split_idx = match.end()
                     sentence = buffer[:split_idx]
-                    buffer = buffer[split_idx:]  # Остаток оставляем в буфере
+                    buffer = buffer[split_idx:]  # Keep the remainder buffered.
 
-                    # Отправляем готовое предложение
+                    # Send the completed sentence.
                     if sentence.strip():
                         await ws.send(json.dumps({"text": sentence}))
 
                 elif len(buffer) > max_buffer_size:
-                    # Буфер переполнен, а точки нет. Ищем хотя бы пробел, чтобы не резать слово.
+                    # Buffer overflowed with no punctuation. Look for at
+                    # least a space so we don't cut a word in half.
                     last_space = buffer.rfind(" ")
                     if last_space != -1:
                         part = buffer[:last_space]
-                        buffer = buffer[last_space:]  # Пробел и остаток оставляем
+                        buffer = buffer[last_space:]  # Keep space + remainder.
                         await ws.send(json.dumps({"text": part}))
                     else:
-                        # Даже пробелов нет (очень длинное слово?), отправляем как есть
+                        # No spaces at all (very long "word"?), send as-is.
                         await ws.send(json.dumps({"text": buffer}))
                         buffer = ""
-                    break  # Ждем следующих чанков
+                    break  # Wait for more chunks.
 
                 else:
-                    # Разделителей нет и буфер не полон -> ждем данных
+                    # No separators yet and buffer isn't full -> wait for
+                    # more data.
                     break
 
-        # Итератор закончился. Отправляем всё, что осталось в буфере с флагом last=True
+        # Iterator exhausted. Send whatever is left in the buffer with the
+        # last=True flag.
         payload = {"text": buffer, "last": True}
         await ws.send(json.dumps(payload))
 
@@ -174,11 +231,11 @@ class TTSResource(BaseResource):
         ws: Connection,
     ):
         """
-        Простой режим: отправляет чанки сразу, как они приходят.
+        Simple mode: sends chunks immediately as they arrive.
         """
         async for chunk in text_iter:
             if chunk:
                 await ws.send(json.dumps({"text": chunk}))
 
-        # Сигнализируем о конце потока
+        # Signal end of stream.
         await ws.send(json.dumps({"last": True}))
