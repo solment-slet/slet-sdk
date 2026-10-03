@@ -986,6 +986,7 @@ class AgentSession:
             ping_timeout=20,
             close_timeout=10,
             additional_headers=self.headers,
+            max_size=None,
         )
 
     def _add_callbacks_attributes(self) -> None:

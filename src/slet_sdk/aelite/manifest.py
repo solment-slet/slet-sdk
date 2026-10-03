@@ -1721,42 +1721,83 @@ class ToolConfig(BaseModel):
 # ===========================================================================
 
 
-class TTSConfig(BaseModel):
+class PiperTTSConfig(BaseModel):
     """
-    Text-to-Speech synthesis parameters for the Piper TTS engine.
+    Параметры синтеза речи движком Piper (engine="piper").
 
-    All fields are optional overrides of the Piper models's built-in defaults.
-    TTS is activated by setting ``voice`` to a valid Piper voice models name.
+    Все поля необязательны и переопределяют значения модели по умолчанию.
     """
 
+    engine: Literal["piper"] = "piper"
     voice: str | None = Field(
         default=None,
-        description="Piper voice models name from the official registry.",
+        description="Имя голосовой модели Piper из официального реестра.",
     )
     speaker_id: int | None = Field(
         default=None,
-        description="Speaker index for multi-speaker models. Ignored for single-speaker.",
+        description="Индекс спикера для мультиспикерных моделей. Для односпикерных игнорируется.",
     )
     length_scale: float | None = Field(
         default=None,
-        description="Speech rate multiplier. < 1.0 speeds up; > 1.0 slows down.",
+        description="Множитель скорости речи. < 1.0 быстрее; > 1.0 медленнее.",
     )
     noise_scale: float | None = Field(
         default=None,
-        description="Generator noise controlling expressiveness and pitch variation.",
+        description="Шум генератора: выразительность и вариативность тона.",
     )
     noise_w_scale: float | None = Field(
         default=None,
-        description="Phoneme duration noise controlling rhythm and pause variability.",
+        description="Шум длительности фонем: ритм и вариативность пауз.",
     )
     normalize_audio: bool | None = Field(
         default=None,
-        description="When True, audio samples are scaled to full amplitude range.",
+        description="True - нормализовать амплитуду до полного диапазона.",
     )
     volume: float | None = Field(
         default=None,
-        description="Output volume multiplier. < 1.0 quieter; > 1.0 louder.",
+        description="Множитель громкости. < 1.0 тише; > 1.0 громче.",
     )
+
+
+class SileroTTSConfig(BaseModel):
+    """
+    Параметры синтеза речи движком Silero (engine="silero").
+
+    Silero не поддерживает стриминг: каждый текстовый чанк синтезируется целиком.
+    Чем крупнее чанк, тем больше задержка до первого звука, и дробить текст
+    должен клиент.
+    """
+
+    engine: Literal["silero"] = "silero"
+    speaker: str | None = Field(
+        default=None,
+        description="Имя спикера Silero (например 'xenia', 'aidar'). "
+        "None - спикер по умолчанию на сервере.",
+    )
+    sample_rate: Literal[8000, 24000, 48000] | None = Field(
+        default=None,
+        description="Частота дискретизации, Гц. None - значение по умолчанию на сервере.",
+    )
+    speed: Literal["x-slow", "slow", "medium", "fast", "x-fast"] | None = Field(
+        default=None,
+        description="Скорость речи. Сервер оборачивает текст в <speak><prosody rate=...>. "
+        "Нельзя использовать вместе с ssml=True.",
+    )
+    ssml: bool = Field(
+        default=False,
+        description="True - отправляемый text является готовым SSML (начинается с <speak>).",
+    )
+
+    @model_validator(mode="after")
+    def _speed_xor_ssml(self) -> "SileroTTSConfig":
+        """speed и ssml взаимоисключающие."""
+        if self.ssml and self.speed is not None:
+            raise ValueError("'speed' и 'ssml=True' нельзя задавать одновременно.")
+        return self
+
+
+# Тип для полей, где допустим любой движок. Pydantic выбирает модель по "engine".
+TTSConfig = Annotated[PiperTTSConfig | SileroTTSConfig, Field(discriminator="engine")]
 
 
 class Components(BaseModel):
@@ -1767,9 +1808,11 @@ class Components(BaseModel):
     no runtime cost.
     """
 
-    tts: TTSConfig = Field(
-        default_factory=TTSConfig,
-        description="Text-to-Speech configuration. Activated by setting ``tts.voice``.",
+    tts: TTSConfig | None = Field(
+        default=None,
+        description="Text-to-Speech configuration. TTS is enabled when this is set "
+        "(PiperTTSConfig or SileroTTSConfig, selected by ``engine``); "
+        "None disables it.",
     )
 
 

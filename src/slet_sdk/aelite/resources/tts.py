@@ -8,7 +8,7 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 from websockets.asyncio.connection import Connection
 
-from slet_sdk.aelite.manifest import TTSConfig
+from slet_sdk.aelite.manifest import PiperTTSConfig, SileroTTSConfig, TTSConfig
 from slet_sdk.aelite.types import TTSStreamItem, TTSStreamConfig
 
 
@@ -16,18 +16,29 @@ class TTSResource(BaseResource):
     async def stream_tts(
         self,
         text_iterator: AsyncIterator[str],
-        tts_config: TTSConfig = TTSConfig(),
+        tts_config: TTSConfig | None = None,
         smart_buffering: bool = True,
         smart_buffer_max_chunk_size: int = 200,
     ) -> AsyncGenerator[TTSStreamItem, None]:
         """
-        Streaming client for Piper TTS. Consumes a stream of text (e.g. LLM
-        tokens), buffers it into sentences automatically, and yields the
-        resulting audio stream.
+        Streaming client for the TTS service (Piper or Silero). Consumes a
+        stream of text (e.g. LLM tokens), buffers it into sentences
+        automatically, and yields the resulting audio stream.
+
+        The engine is selected by the type of `tts_config`:
+        `PiperTTSConfig` (default) or `SileroTTSConfig`.
+
+        Piper streams audio as it is generated. Silero does NOT support
+        streaming: every text chunk sent to the server is synthesized
+        completely before its audio is returned. The larger the chunk, the
+        longer the delay before its first sound, so keep chunks small (smart
+        buffering sends one sentence at a time, which is a good default).
 
         The first item yielded is always a `TTSStreamConfig` describing the
         audio format (sample_rate/sample_width/channels), sent by the server
-        in its "config" event. Every item after that is a `bytes` chunk of
+        in its "config" event. It is produced when the first text chunk
+        starts synthesizing (not at connection time), and is yielded again
+        only if the format changes. Every other item is a `bytes` chunk of
         raw PCM int16 audio. Callers MUST check the type of each yielded
         item (e.g. `isinstance(item, TTSStreamConfig)`) before treating it
         as audio.
@@ -35,44 +46,62 @@ class TTSResource(BaseResource):
         Args:
             text_iterator (AsyncIterator[str]): Async generator producing
                 chunks of text (tokens).
-            tts_config (TTSConfig): TTS settings (voice, speaker_id, etc).
+            tts_config (TTSConfig | None): Engine settings. None means
+                `PiperTTSConfig()` (server default Piper voice).
             smart_buffering (bool): If True, accumulate tokens into full
-                sentences before sending them to the server.
+                sentences before sending them to the server. Must be False
+                for Silero with `ssml=True`, because splitting would break
+                the SSML markup.
             smart_buffer_max_chunk_size (int): Buffer length limit (chars)
                 so we don't accumulate forever when there's no punctuation.
 
         Yields:
-            TTSStreamConfig: Exactly once, before any audio, describing the
-                audio format.
+            TTSStreamConfig: Before any audio, describing the audio format.
             bytes: Raw PCM int16 audio chunks.
 
         Raises:
+            ValueError: If Silero SSML mode is combined with smart_buffering.
             ConnectionClosed: If the server closes the connection
                 unexpectedly.
-            RuntimeError: If the server reports an "error" event, or if the
-                connection closes before a "config" event was ever received.
+            RuntimeError: If the server reports an "error" event, or if
+                audio arrives before a "config" event.
             Exception: On other internal WebSocket errors.
         """
+        if tts_config is None:
+            tts_config = PiperTTSConfig()
+
+        # With SSML every text chunk must be a complete <speak>...</speak>
+        # document. Sentence splitting would cut it into invalid fragments.
+        if (
+            isinstance(tts_config, SileroTTSConfig)
+            and tts_config.ssml
+            and smart_buffering
+        ):
+            raise ValueError(
+                "smart_buffering must be disabled when ssml=True: each item of "
+                "text_iterator has to be a complete SSML document."
+            )
+
         url = f"{self.base_ws_url}/tts/ws"
         headers = {"Authorization": f"Bearer {self._access_token}"}
 
-        # Session configuration.
-        session_config = tts_config.model_dump()
-        # Drop None values so we don't send garbage to the server.
-        session_config = {k: v for k, v in session_config.items() if v is not None}
+        # Session configuration. Includes "engine"; None values are dropped
+        # so we don't send garbage to the server.
+        session_config = tts_config.model_dump(exclude_none=True)
 
-        async with websockets.connect(url, additional_headers=headers) as ws:
-            # 1. Send the initial config (optional if defaults are fine, but
-            # it's better to set the voice explicitly).
+        async with websockets.connect(url, additional_headers=headers, max_size=None) as ws:
+            # 1. Send the initial config (engine + engine parameters). The
+            # server keeps these for the whole session. Invalid parameters
+            # come back as an "error" event.
             await ws.send(json.dumps(session_config))
 
             # Event used to signal that we're done sending text.
             sender_task_done = asyncio.Event()
 
-            # Whether we've already yielded the TTSStreamConfig to the
-            # caller. The server sends "config" once per connection, but we
-            # guard against sending it twice just in case.
-            config_sent = False
+            # Last audio format announced by the server as
+            # (sample_rate, sample_width, channels). None until the first
+            # "config" event arrives.
+            audio_format: tuple[int, int, int] | None = None
 
             # ------------------------------------------------------------------
             # Internal task: read from the iterator -> buffer -> send
@@ -107,7 +136,7 @@ class TTSResource(BaseResource):
 
                         if isinstance(msg, bytes):
                             # This is an audio chunk.
-                            if not config_sent:
+                            if audio_format is None:
                                 # Defensive: the server should always send
                                 # "config" before any audio, but if it
                                 # didn't, we can't tell the caller the
@@ -124,14 +153,22 @@ class TTSResource(BaseResource):
                             event_type = event.get("event")
 
                             if event_type == "config":
-                                # First message: audio format descriptor.
-                                stream_config = TTSStreamConfig(
-                                    sample_rate=event["sample_rate"],
-                                    sample_width=event["sample_width"],
-                                    channels=event["channels"],
+                                # Audio format descriptor. The server sends it
+                                # before the first synthesis and again only if
+                                # the format changes; extra fields (e.g.
+                                # "engine") are ignored.
+                                new_format = (
+                                    event["sample_rate"],
+                                    event["sample_width"],
+                                    event["channels"],
                                 )
-                                config_sent = True
-                                yield stream_config
+                                if new_format != audio_format:
+                                    audio_format = new_format
+                                    yield TTSStreamConfig(
+                                        sample_rate=new_format[0],
+                                        sample_width=new_format[1],
+                                        channels=new_format[2],
+                                    )
 
                             elif event_type == "done":
                                 # Server confirmed synthesis is fully done.
@@ -161,9 +198,11 @@ class TTSResource(BaseResource):
 
             finally:
                 # Make sure the sender task is also finished (or cancel it).
+                # gather(return_exceptions=True) swallows the child's
+                # CancelledError instead of re-raising it into the caller.
                 if not sender_task.done():
                     sender_task.cancel()
-                await sender_task
+                await asyncio.gather(sender_task, return_exceptions=True)
 
     # --------------------------------------------------------------------------
     # Buffering logic
@@ -232,7 +271,10 @@ class TTSResource(BaseResource):
         ws: Connection,
     ):
         """
-        Simple mode: sends chunks immediately as they arrive.
+        Simple mode: sends chunks immediately as they arrive. Every chunk is
+        synthesized on its own, so for Silero each item of the iterator should
+        be a meaningful phrase (or a complete SSML document when ssml=True),
+        not a single LLM token.
         """
         async for chunk in text_iter:
             if chunk:
