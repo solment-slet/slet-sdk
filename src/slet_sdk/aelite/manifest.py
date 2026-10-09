@@ -573,17 +573,22 @@ class ModelConfig(BaseModel):
             "has no equivalent parameter (use thinking_budget_tokens instead)."
         ),
     )
-    thinking_enabled: bool = Field(
-        default=False,
+    thinking_enabled: bool | None = Field(
+        default=None,
         description=(
-            "Enable extended thinking / reasoning mode (Anthropic extended "
-            "thinking, DeepSeek-R1, and similar). When enabled, the model "
-            "emits intermediate reasoning steps before its final answer. "
-            "Note: for Anthropic models this forces temperature=1 and "
-            "disables top_p, per the provider's API constraints. For "
-            "OPENAI_COMPATIBLE providers, this requires is_reasoning_model=True, "
-            "reasoning_effort or reasoning_format to be set, otherwise it has "
-            "no effect."
+            "Control extended thinking / reasoning mode (Anthropic extended "
+            "thinking, DeepSeek-R1, and similar). None (default) leaves "
+            "thinking unmanaged: nothing is sent and the provider's own "
+            "default applies. True enables it: the model emits intermediate "
+            "reasoning steps before its final answer. Note: for Anthropic "
+            "models this forces temperature=1 and disables top_p, per the "
+            "provider's API constraints. For OPENAI_COMPATIBLE providers, "
+            "True requires is_reasoning_model=True, reasoning_effort or "
+            "reasoning_format to be set, otherwise it has no effect. False "
+            "explicitly asks OPENAI_COMPATIBLE servers that support it "
+            "(e.g. llama.cpp with a thinking-capable chat template) not to "
+            "think, via chat_template_kwargs.enable_thinking=false; for "
+            "Anthropic it is equivalent to None."
         ),
     )
     thinking_budget_tokens: int | None = Field(
