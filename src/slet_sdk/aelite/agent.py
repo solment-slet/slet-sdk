@@ -154,7 +154,6 @@ class AgentSession:
         *,
         # Main
         thread_id: str,
-        headers: dict,
         device: str = get_device_string(),
         stream_mode: StreamMode | str = StreamMode.tokens,
         manifest: AgentManifest | None = None,
@@ -181,7 +180,6 @@ class AgentSession:
             f"{self.ws_url}/agents/ws/{self.thread_id}?{urlencode(params)}"
         )
 
-        self.headers = headers
         self.websocket = None
         self.logger = self._resource.logger
         self._is_connected = False
@@ -980,12 +978,19 @@ class AgentSession:
         self._invoke_callback(self.on_error, SletClientError(ProtocolError(message=message)))
 
     async def _connect_websocket(self) -> None:
-        self.websocket = await self._resource.websockets.connect(
+        """
+        Opens the WebSocket connection with a fresh access token.
+
+        Authorization is handled by the resource: the token is refreshed
+        if it has expired, and the handshake is retried once on 401/403.
+        Called both for the initial connect and for every reconnect attempt,
+        so a long-lived session never reuses a stale token.
+        """
+        self.websocket = await self._resource._connect_ws(
             self._ws_connect_url,
             ping_interval=20,
             ping_timeout=20,
             close_timeout=10,
-            additional_headers=self.headers,
             max_size=None,
         )
 
@@ -1631,6 +1636,12 @@ class AgentSession:
                 return  # ✅ Success
 
             except Exception as e:
+                # Auth failures can't be fixed by retrying: refresh token is
+                # dead, the user has to sign in again.
+                fatal = (
+                    isinstance(e, SletClientError)
+                    and e.status in (401, 403)
+                )
                 message = (
                     "WebSocket reconnection failed. Maximum attempts reached."
                     if is_last
@@ -1645,7 +1656,7 @@ class AgentSession:
                 if self.on_error:
                     self._invoke_callback(self.on_error, SletClientError(error))
 
-                if is_last:
+                if is_last or fatal:
                     # Unblock waiters so they don't hang forever
                     self._reconnect_event.set()
                     raise SletClientError(error)

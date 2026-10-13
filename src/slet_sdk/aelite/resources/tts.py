@@ -83,13 +83,13 @@ class TTSResource(BaseResource):
             )
 
         url = f"{self.base_ws_url}/tts/ws"
-        headers = {"Authorization": f"Bearer {self._access_token}"}
 
         # Session configuration. Includes "engine"; None values are dropped
         # so we don't send garbage to the server.
         session_config = tts_config.model_dump(exclude_none=True)
 
-        async with websockets.connect(url, additional_headers=headers, max_size=None) as ws:
+        ws = await self._connect_ws(url, max_size=None)
+        async with ws:
             # 1. Send the initial config (engine + engine parameters). The
             # server keeps these for the whole session. Invalid parameters
             # come back as an "error" event.

@@ -205,10 +205,6 @@ class AeliteResource(BaseResource):
         """
         Рекурсивно строит дерево AgentSession по манифесту.
         """
-        headers = {}
-        if self._access_token:
-            headers["Authorization"] = f"Bearer {self._access_token}"
-
         tid = session_id_map.get(manifest.id)
         if not tid:
             raise ValueError(
@@ -220,7 +216,6 @@ class AeliteResource(BaseResource):
             thread_id=tid,
             device=device,
             stream_mode=stream_mode,
-            headers=headers,
             manifest=manifest,
             resource=self,
         )
